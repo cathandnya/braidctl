@@ -170,7 +170,7 @@ Destroying an array by mistyping a device node is a real risk for a tool like th
 - Capacities are decimal (1 TB = 10¹² bytes), like the drive labels and like Drobo. `df` uses TiB
   and will always look smaller.
 
-## Status and prior art
+## Status
 
 Developed and tested on one machine — Ubuntu 26.04, 4 mixed USB drives (1.8/1.8/2.3/0.9 TB) serving
 Samba and Time Machine. Drive-loss, auto-rebuild, re-add, scrub and the capacity-refusal paths are
@@ -178,18 +178,7 @@ exercised on real hardware and on loop devices; see [docs/testing.md](docs/testi
 any of it before trusting it with data. Treat it as what it is: a small tool doing a sharp thing to
 your disks. Have backups.
 
-Related projects worth knowing about:
-
-- [danneu/braid](https://github.com/danneu/braid) — a NixOS module and Rust CLI for *encrypted*
-  btrfs RAID1 NAS, with LUKS, USB-keyfile unlock and UPS integration. Similar territory; it
-  rebuilds onto a replacement drive you provide, rather than re-laying-out onto the survivors.
-- [snapraid](https://www.snapraid.it/) + [mergerfs](https://github.com/trapexit/mergerfs) — parity
-  snapshots over independent filesystems. Excellent for archives; a poor fit for data that changes
-  between syncs, and recovery is manual.
-- ZFS — stronger in almost every way except the one that matters here: a vdev is sized by its
-  smallest member, so mixed-size drives waste space.
-
-See [docs/design.md](docs/design.md) for why btrfs RAID1 and not those, and
+See [docs/design.md](docs/design.md) for why btrfs RAID1, and
 [docs/operations.md](docs/operations.md) for the day-to-day runbook.
 
 ## License

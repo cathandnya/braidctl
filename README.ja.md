@@ -166,23 +166,12 @@ JSON なら何でも `notify.config_file` に指定できる。設定が無く�
 - 容量は 10 進表記 (1 TB = 10¹² バイト)。ドライブのラベルと同じ、Drobo と同じ。`df` は TiB なので
   常に小さく見える
 
-## 状態と類似プロジェクト
+## 状態
 
 1 台のマシンで開発・検証している — Ubuntu 26.04、Samba と Time Machine を提供する USB ドライブ
 4 台 (1.8/1.8/2.3/0.9 TB)。ドライブ脱落、自動再構築、再追加、scrub、容量不足による拒否は実機と
 ループデバイスで確認済み。[docs/testing.md](docs/testing.md) に再現手順がある。データを預ける前に
 自分で確かめてほしい。これはディスクに対して鋭いことをする小さなツールだ。バックアップを取ること。
-
-知っておく価値のある関連プロジェクト:
-
-- [danneu/braid](https://github.com/danneu/braid) — *暗号化* btrfs RAID1 NAS のための NixOS モジュール
-  + Rust CLI。LUKS、USB キーファイルによるアンロック、UPS 連携。領域は近いが、こちらは
-  生存ドライブへの再配置ではなく、用意した交換ドライブへ再構築する
-- [snapraid](https://www.snapraid.it/) + [mergerfs](https://github.com/trapexit/mergerfs) —
-  独立したファイルシステムの上のパリティスナップショット。アーカイブには最適。sync の間に変わる
-  データには向かず、復旧も手動
-- ZFS — ほぼすべての面で強力だが、ここで重要な 1 点が駄目。vdev は最小のメンバーに合わせられるので
-  容量混在は無駄になる
 
 btrfs RAID1 を選んだ理由は [docs/design.md](docs/design.md)、日常の運用は
 [docs/operations.md](docs/operations.md)。

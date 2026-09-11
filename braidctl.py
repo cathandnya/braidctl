@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-braidctl — btrfs raid1 の上に Drobo BeyondRAID 風の運用層を載せる。
+braidctl — Drobo BeyondRAID-style pool management on top of btrfs raid1.
 
-  status [--json]      実容量 / 使える容量 / 使用量 / 保護状態 / ドライブ一覧
-  add DEV [--force]    ドライブを追加して再配置（署名のあるドライブは拒否）
-  remove ID|DEV        ドライブを安全に外す（外した後も収まるときだけ）
-  monitor              timer から定期実行。脱落・故障の検知と自動再冗長化
-  scrub                全データの検証（月次 timer）
-  mount-degraded       1 台欠けた状態で縮退マウントする（手動用）
+  status [--json]      raw / usable / used capacity, protection state, per-drive health
+  add DEV [--force]    add a drive and rebalance (refuses a drive that carries data)
+  remove ID|DEV        remove a drive safely (only if what remains can still hold the data)
+  monitor              run from a timer: detect losses and failures, re-protect automatically
+  scrub                verify every block against its checksum (monthly timer)
+  mount-degraded       mount with a drive missing, by hand
 
-btrfs 本体がやること: チャンク単位の 2 重化、容量混在、オンライン増減。
-このツールがやること: Drobo がファームウェアでやっている表示・検知・自動復旧・安全装置。
+btrfs itself provides chunk-level mirroring, mixed drive sizes, and online add/remove.
+This tool provides what Drobo did in firmware: reporting, detection, automatic recovery,
+and the interlocks that keep it from eating the wrong disk.
 """
 
 import argparse
@@ -36,23 +37,24 @@ CONFIG_PATH = "/etc/braid/braid.toml"
 DEFAULT_CONFIG = {
     "mountpoint": "/srv/pool",
     "label": "braid",
-    # 脱落を検知してから自動再冗長化を始めるまでの待ち時間。USB 瞬断で走らないための猶予
+    # Grace period between noticing a drive is gone and re-laying-out without it.
+    # Exists so a USB bus glitch that clears in seconds does not trigger a rebuild.
     "debounce_sec": 600,
-    # 「外した後の使える容量 × margin >= 使用量」なら再構築可能と判定する
+    # Rebuild is considered possible when used <= usable_after_loss * this
     "rebuild_margin": 0.95,
     "warn_percent": 90,
-    # 縮退再マウントの間だけ止めるサービス
+    # Services stopped only for the degraded-remount fallback
     "samba_units": ["smbd"],
     "state_file": "/var/lib/braid/state.json",
     "remind_interval_sec": 86400,
     "smart_args": ["-d", "sat"],
-    # エラーカウンタが増え続ける「生きているが壊れかけ」のドライブを自動で外すか
+    # Evict drives that are failing but still present, instead of only reporting them
     "auto_evict_on_errors": False,
     "error_threshold": 10,
-    # add で絶対に触らないデバイス (/dev/disk/by-id の部分文字列)
+    # Substrings of /dev/disk/by-id names that `add` must always refuse
     "protected_devices": [],
     "notify": {
-        # nas-monitor と同じ Gmail SMTP 設定を流用する
+        # Borrow the SMTP block from an existing nas-monitor-style config
         "config_file": "/etc/nas-monitor/config.json",
         "to": "",
         "subject_prefix": "[braid]",
@@ -76,7 +78,7 @@ def run(cmd, check=True, ok_codes=(0,), capture=True):
 
 
 def fmt_bytes(n):
-    """Drobo 風に 10 進 (1 TB = 10^12) で表示する"""
+    """Decimal units (1 TB = 10^12), matching drive labels and Drobo"""
     n = float(n)
     for unit, div in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
         if n >= div:
@@ -86,7 +88,7 @@ def fmt_bytes(n):
 
 def require_root():
     if os.geteuid() != 0:
-        raise BraidError("root 権限が必要です (sudo で実行してください)")
+        raise BraidError("root privileges required (run with sudo)")
 
 
 def load_config(path):
@@ -104,7 +106,7 @@ def load_config(path):
 
 
 def raid1_usable(sizes):
-    """raid1 で 2 重化したときに格納できる論理容量 (チャンク割当の理想値)"""
+    """Logical capacity of a two-copy pool over these drives (ideal chunk allocation)"""
     sizes = [s for s in sizes if s > 0]
     if len(sizes) < 2:
         return 0
@@ -130,7 +132,7 @@ def flatten_lsblk(nodes):
 
 
 def parent_disk(path):
-    """パーティションなら親ディスク、ディスクならそのまま"""
+    """The containing disk for a partition; the device itself for a whole disk"""
     p = run(["lsblk", "-no", "PKNAME", path], check=False)
     pk = (p.stdout or "").strip().splitlines()
     return f"/dev/{pk[0]}" if pk and pk[0] else path
@@ -139,12 +141,13 @@ def parent_disk(path):
 # ---------------------------------------------------------------- state
 
 class State:
-    """/var/lib/braid/state.json — 脱落の初回検知時刻、エラーカウンタ基準値、通知抑制、在庫"""
+    """/var/lib/braid/state.json — when each loss was first seen, error/SMART baselines,
+    notification rate limiting, and an inventory so a vanished drive can still be named"""
 
     def __init__(self, path):
         self.path = Path(path)
         self.data = {"missing": {}, "err_base": {}, "last_notify": {}, "inventory": {},
-                     "rebuild": None, "smart_alerted": {}}
+                     "rebuild": None, "smart_base": {}}
         self._lock_fh = None
 
     def lock(self):
@@ -153,14 +156,14 @@ class State:
         try:
             fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise BraidError("別の braidctl が実行中です (monitor/rebuild)")
+            raise BraidError("another braidctl is already running (monitor/rebuild)")
 
     def load(self):
         if self.path.exists():
             try:
                 self.data.update(json.loads(self.path.read_text()))
             except json.JSONDecodeError:
-                LOG.warning("state file が壊れています。初期化します: %s", self.path)
+                LOG.warning("state file is corrupt, starting fresh: %s", self.path)
         return self
 
     def save(self):
@@ -191,7 +194,7 @@ class Notifier:
             src = json.loads(Path(self.cfg["config_file"]).read_text())
             self.email = src["notification"]["email"]
         except (OSError, KeyError, json.JSONDecodeError) as e:
-            LOG.warning("通知設定を読めません (%s)。メール通知は無効", e)
+            LOG.warning("no usable notification config (%s); email disabled", e)
 
     def send(self, subject, body):
         LOG.info("NOTIFY %s\n%s", subject, body)
@@ -210,7 +213,7 @@ class Notifier:
                 s.login(e["username"], e["password"])
                 s.send_message(msg)
         except (OSError, smtplib.SMTPException) as ex:
-            LOG.error("メール送信に失敗: %s", ex)
+            LOG.error("failed to send mail: %s", ex)
 
 
 # ---------------------------------------------------------------- btrfs
@@ -218,11 +221,11 @@ class Notifier:
 @dataclass
 class Device:
     devid: int
-    path: str          # 欠けている場合は ''
+    path: str          # '' when the device is missing
     size: int
-    used: int          # このデバイス上に割り当て済みの生バイト数
+    used: int          # raw bytes allocated to chunks on this device
     missing: bool = False
-    present: bool = True   # デバイスノードが存在するか
+    present: bool = True   # whether the device node exists
     model: str = ""
     serial: str = ""
     tran: str = ""
@@ -236,8 +239,8 @@ class Device:
 
 @dataclass
 class Usage:
-    raw: int            # Device size (全ドライブ合計)
-    used: int           # データ+メタデータの論理使用量
+    raw: int            # Device size, summed over all members
+    used: int           # logical data + metadata in use
     data_used: int
     meta_used: int
     free: int           # Free (estimated)
@@ -274,7 +277,7 @@ class Pool:
         return (p.stdout or "").strip()
 
     def member_devices_present(self):
-        """マウントの有無に関わらず、ラベル一致の btrfs メンバーとして見えているデバイス"""
+        """Devices visible as members of this pool, mounted or not"""
         out = []
         for n in flatten_lsblk(lsblk()):
             if n.get("fstype") == "btrfs" and n.get("label") == self.label:
@@ -283,15 +286,16 @@ class Pool:
 
     @staticmethod
     def superblock(path):
-        """デバイスのスーパーブロックから (fsid, devid) を読む"""
+        """Read (fsid, devid) out of a device's btrfs superblock"""
         p = run(["btrfs", "inspect-internal", "dump-super", path], check=False)
         fs = re.search(r"^fsid\s+(\S+)", p.stdout, re.M)
         dv = re.search(r"dev_item\.devid\s+(\d+)", p.stdout)
         return (fs[1] if fs else None, int(dv[1]) if dv else None)
 
     def returned_members(self, report):
-        """欠けている devid のうち、デバイスとして再び見えているもの → [(path, devid)]。
-        既に外し終えた古いメンバー (devid が fs に無い) は stale として別に返す"""
+        """Devices carrying this pool's fsid that are not currently attached.
+        Those whose devid the filesystem still expects have come back -> returned;
+        those it no longer knows were already evicted -> stale."""
         gone_ids = {d.devid for d in report.gone}
         fs_paths = {os.path.realpath(d.path) for d in report.devs if d.present}
         uuid = self.uuid()
@@ -319,7 +323,7 @@ class Pool:
             d = Device(devid=int(m[1]), size=int(m[2]), used=int(m[3]), path=path,
                        missing=bool(m[5]) or not path)
             devs.append(d)
-        # sysfs の missing フラグも見る（progs の表示より確実）
+        # Trust sysfs over the progs output for the missing flag
         uuid = self.uuid()
         for d in devs:
             f = Path(f"/sys/fs/btrfs/{uuid}/devinfo/{d.devid}/missing")
@@ -348,7 +352,7 @@ class Pool:
             m = re.match(r"(Data|Metadata|System),(\S+): Size:(\d+), Used:(\d+)", line)
             if m:
                 kind, prof, used = m[1], m[2], int(m[4])
-                # 同種で複数プロファイルがある場合は連結して表示
+                # Join them if a block type somehow has more than one profile
                 profiles[kind] = prof if kind not in profiles else f"{profiles[kind]}+{prof}"
                 if kind == "Data":
                     data_used += used
@@ -413,7 +417,7 @@ class Pool:
         return run(["findmnt", "--fstab", "-n", self.mnt], check=False).returncode == 0
 
     def mount(self, degraded=False, check=True):
-        """fstab にあればその設定で、無ければ LABEL 指定でマウントする"""
+        """Mount via fstab if there is an entry, otherwise by label"""
         cmd = ["mount"]
         if self.in_fstab():
             if degraded:
@@ -428,22 +432,23 @@ class Pool:
             p = run(["umount", self.mnt], check=False)
             if p.returncode == 0:
                 return
-            LOG.warning("umount 失敗 (%d/%d): %s", i + 1, retries, p.stderr.strip())
+            LOG.warning("umount failed (%d/%d): %s", i + 1, retries, p.stderr.strip())
             time.sleep(5)
-        raise BraidError(f"{self.mnt} を umount できません (使用中)")
+        raise BraidError(f"cannot unmount {self.mnt} (busy)")
 
     def remove_device(self, target, stream=False):
         cmd = ["btrfs", "device", "remove", str(target), self.mnt]
         return run(cmd, check=False, capture=not stream)
 
     def balance_soft_convert(self):
-        """縮退中に作られた不完全なチャンクを raid1 に揃える"""
+        """Bring chunks written while degraded back up to raid1"""
         run(["btrfs", "balance", "start", "--bg", "-dconvert=raid1,soft", "-mconvert=raid1,soft", self.mnt],
             check=False)
 
     def compact(self, usage=50):
-        """スカスカのチャンクを詰めて未割当領域を作る (remove の前に行うと ENOSPC を避けやすい)。同期実行"""
-        LOG.info("compaction balance (usage<%d%%) 実行中", usage)
+        """Consolidate half-empty chunks to free unallocated space. Doing this before a
+        `device remove` is what keeps it from dying of ENOSPC halfway. Runs synchronously."""
+        LOG.info("compaction balance (usage<%d%%) running", usage)
         run(["btrfs", "balance", "start", f"-dusage={usage}", f"-musage={usage}", self.mnt], check=False)
 
 
@@ -488,7 +493,8 @@ def collect(pool):
 
 
 def can_rebuild(report, cfg, losing=None):
-    """losing (list[Device]) を失った状態で再冗長化できるか。戻り値 (ok, usable_after, needed)"""
+    """Could the pool be re-protected after losing these devices?
+    Returns (ok, usable_after, needed)."""
     losing = losing or report.gone
     exclude = {d.devid for d in report.gone} | {d.devid for d in losing}
     sizes = [d.size for d in report.devs if d.devid not in exclude]
@@ -504,10 +510,10 @@ def render_status(report, cfg, state=None):
     lines = []
     label = report.state_label()
     lines.append(f"braid  {cfg['mountpoint']}   {label} ({'/'.join(sorted(set(u.profiles.values())) or ['-'])})"
-                 + ("   [mount option: degraded]" if report.mounted_degraded else ""))
+                 + ("   [mounted degraded]" if report.mounted_degraded else ""))
     pct = (u.used / u.usable * 100) if u.usable else 0
-    lines.append(f"実容量 {fmt_bytes(u.raw):>10}   使える容量 {fmt_bytes(u.usable):>10}   "
-                 f"使用 {fmt_bytes(u.used):>10} ({pct:.0f}%)   空き {fmt_bytes(u.free):>10}")
+    lines.append(f"Raw {fmt_bytes(u.raw):>10}   Usable {fmt_bytes(u.usable):>10}   "
+                 f"Used {fmt_bytes(u.used):>10} ({pct:.0f}%)   Free {fmt_bytes(u.free):>10}")
     lines.append("")
     lines.append(f"{'ID':>2}  {'device':8} {'model':22} {'size':>9} {'alloc':>9}  {'errors':>6}  health")
     inv = (state.data.get("inventory", {}) if state else {})
@@ -539,32 +545,33 @@ def render_status(report, cfg, state=None):
     if report.gone:
         ok, after, needed = can_rebuild(report, cfg)
         if ok:
-            lines.append(f"! {len(report.gone)} 台が欠けています。残りで再冗長化可能 "
-                         f"(使える容量 {fmt_bytes(after)} >= 使用 {fmt_bytes(needed)})。monitor が自動で実行します")
+            lines.append(f"! {len(report.gone)} drive(s) missing. Can re-protect with what remains "
+                         f"(usable {fmt_bytes(after)} >= used {fmt_bytes(needed)}); the monitor will do it")
         else:
             short = needed / cfg["rebuild_margin"] - after
-            lines.append(f"!! {len(report.gone)} 台が欠けています。残りの容量では再冗長化できません "
-                         f"(使える容量 {fmt_bytes(after)} < 使用 {fmt_bytes(needed)})。"
-                         f"あと {fmt_bytes(short)} 分のドライブを追加してください")
+            lines.append(f"!! {len(report.gone)} drive(s) missing. Cannot re-protect with what remains "
+                         f"(usable {fmt_bytes(after)} < used {fmt_bytes(needed)}). "
+                         f"Add at least {fmt_bytes(short)} more")
     else:
         healthy = [d for d in report.devs if d.present]
         if len(healthy) >= 2:
             largest = max(healthy, key=lambda d: d.size)
             after = report.usable_after_losing(largest)
             if u.used <= after * cfg["rebuild_margin"]:
-                lines.append(f"どの 1 台を失っても再冗長化できます "
-                             f"(最大の {largest.name} {fmt_bytes(largest.size)} を失った場合の使える容量 {fmt_bytes(after)} "
-                             f">= 使用 {fmt_bytes(u.used)})")
+                lines.append(f"Any single drive can be lost and re-protected "
+                             f"(losing the largest, {largest.name} {fmt_bytes(largest.size)}, "
+                             f"leaves {fmt_bytes(after)} usable >= {fmt_bytes(u.used)} used)")
             else:
                 tol = [d.name for d in healthy if u.used <= report.usable_after_losing(d) * cfg["rebuild_margin"]]
-                lines.append(f"注意: {largest.name} ({fmt_bytes(largest.size)}) を失うと再冗長化できません "
-                             f"(使える容量 {fmt_bytes(after)} < 使用 {fmt_bytes(u.used)})。"
-                             + (f"自動復旧できるのは {', '.join(tol)} の脱落のみ" if tol else "どの 1 台の脱落も自動復旧できません")
-                             + "。ドライブの追加を検討してください")
+                lines.append(f"Warning: losing {largest.name} ({fmt_bytes(largest.size)}) cannot be re-protected "
+                             f"(would leave {fmt_bytes(after)} usable < {fmt_bytes(u.used)} used). "
+                             + (f"Only losing {', '.join(tol)} can be recovered automatically"
+                                if tol else "No single drive loss can be recovered automatically")
+                             + ". Consider adding a drive")
     if pct >= cfg["warn_percent"]:
-        lines.append(f"警告: 使用率 {pct:.0f}% です。空きが少ないと再構築 (balance) が失敗します")
+        lines.append(f"Warning: {pct:.0f}% full. Rebuilds (balance) fail when free space runs short")
     if report.balance_running:
-        lines.append("balance 実行中 (再配置中)。完了まで性能が落ちます")
+        lines.append("Balance in progress; performance is reduced until it finishes")
     return "\n".join(lines)
 
 
@@ -573,12 +580,12 @@ def cmd_status(cfg, args):
     pool = Pool(cfg)
     if not pool.is_mounted():
         present = pool.member_devices_present()
-        raise BraidError(f"{cfg['mountpoint']} はマウントされていません。"
-                         f"見えているメンバー: {', '.join(present) or 'なし'}"
-                         + ("。1 台欠けているなら `braidctl mount-degraded`" if present else ""))
+        raise BraidError(f"{cfg['mountpoint']} is not mounted. "
+                         f"Members visible: {', '.join(present) or 'none'}"
+                         + (". If one drive is missing, try `braidctl mount-degraded`" if present else ""))
     report = collect(pool)
     state = State(cfg["state_file"]).load()
-    update_inventory(state, report.devs)   # 脱落後に「何が欠けたか」を出せるよう在庫を更新
+    update_inventory(state, report.devs)   # so a later loss can still name the drive
     try:
         state.save()
     except OSError:
@@ -599,38 +606,38 @@ def check_addable(cfg, pool, dev, force):
     try:
         st = os.stat(dev)
     except FileNotFoundError:
-        raise BraidError(f"{dev} が存在しません")
+        raise BraidError(f"{dev} does not exist")
     if not stat.S_ISBLK(st.st_mode):
-        raise BraidError(f"{dev} はブロックデバイスではありません")
+        raise BraidError(f"{dev} is not a block device")
 
-    # ルート FS / 既存マウント / holders (LUKS 等で使用中) は force でも拒否
+    # The system disk, anything mounted, and anything with a holder are refused even with --force
     root_src = run(["findmnt", "-no", "SOURCE", "/"]).stdout.strip()
     root_disk = parent_disk(os.path.realpath(root_src))
     if parent_disk(dev) == root_disk:
-        raise BraidError(f"{dev} はシステムディスク ({root_disk}) です。拒否")
+        raise BraidError(f"refusing {dev}: it is the system disk ({root_disk})")
     nodes = list(flatten_lsblk(lsblk(dev)))
     for n in nodes:
         if any(n.get("mountpoints") or []):
-            raise BraidError(f"{n['path']} はマウント中 ({n['mountpoints']}) です。拒否")
+            raise BraidError(f"refusing {dev}: {n['path']} is mounted at {n['mountpoints']}")
         holders = Path(f"/sys/class/block/{os.path.basename(n['path'])}/holders")
         if holders.exists() and any(holders.iterdir()):
-            raise BraidError(f"{n['path']} は他のデバイス (LUKS/LVM 等) に使われています。拒否")
+            raise BraidError(f"refusing {dev}: {n['path']} is in use by another device (LUKS/LVM/MD)")
     byid = Path("/dev/disk/by-id")
     for link in byid.iterdir() if byid.exists() else []:
         if os.path.realpath(link) == dev:
             for pat in cfg["protected_devices"]:
                 if pat in link.name:
-                    raise BraidError(f"{dev} ({link.name}) は protected_devices に一致します。拒否")
+                    raise BraidError(f"refusing {dev} ({link.name}): matches protected_devices")
     if dev in [d.path for d in pool.devices()]:
-        raise BraidError(f"{dev} は既にプールのメンバーです")
+        raise BraidError(f"{dev} is already a member of this pool")
 
-    # 署名・パーティションがあれば --force が必要
+    # Signatures or partitions mean --force is required
     sigs = run(["wipefs", "-n", dev], check=False).stdout.strip()
     children = [n["path"] for n in nodes if n["path"] != dev]
     if (sigs or children) and not force:
-        raise BraidError(f"{dev} には既存のデータがあります ({'パーティション: ' + ', '.join(children) if children else ''}"
-                         f"{' ' if children and sigs else ''}{'署名: ' + sigs.splitlines()[-1] if sigs else ''}). "
-                         f"消してよければ --force を付けてください")
+        raise BraidError(f"{dev} already holds data ({'partitions: ' + ', '.join(children) if children else ''}"
+                         f"{' ' if children and sigs else ''}{'signature: ' + sigs.splitlines()[-1] if sigs else ''}). "
+                         f"Pass --force to erase it")
     return dev, children
 
 
@@ -638,22 +645,23 @@ def cmd_add(cfg, args):
     require_root()
     pool = Pool(cfg)
     if not pool.is_mounted():
-        raise BraidError(f"{cfg['mountpoint']} がマウントされていません")
+        raise BraidError(f"{cfg['mountpoint']} is not mounted")
     if pool.balance_running():
-        raise BraidError("balance 実行中です。完了後にやり直してください")
+        raise BraidError("a balance is running; try again once it finishes")
     dev, children = check_addable(cfg, pool, args.device, args.force)
     before = pool.usage()
     if args.force:
         for c in children:
             run(["wipefs", "-a", c])
         run(["wipefs", "-a", dev])
-    print(f"== {dev} を追加")
+    print(f"== adding {dev}")
     run(["btrfs", "device", "add", "-f", dev, cfg["mountpoint"]], capture=False)
-    print("== 再配置 (balance) をバックグラウンドで開始")
+    print("== starting background balance to spread data onto it")
     run(["btrfs", "balance", "start", "--bg", "--full-balance", cfg["mountpoint"]], check=False, capture=False)
     time.sleep(2)
     after = pool.usage()
-    print(f"使える容量: {fmt_bytes(before.usable)} -> {fmt_bytes(after.usable)} (balance 完了後に確定)")
+    print(f"usable capacity: {fmt_bytes(before.usable)} -> {fmt_bytes(after.usable)} "
+          f"(final once the balance completes)")
     st = State(cfg["state_file"]).load()
     update_inventory(st, pool.devices())
     st.save()
@@ -665,25 +673,25 @@ def resolve_target(pool, target):
         for d in devs:
             if d.devid == int(target):
                 return d
-        raise BraidError(f"devid {target} はありません")
+        raise BraidError(f"no devid {target} in this pool")
     real = os.path.realpath(target)
     for d in devs:
         if d.path and os.path.realpath(d.path) == real:
             return d
-    raise BraidError(f"{target} はプールのメンバーではありません")
+    raise BraidError(f"{target} is not a member of this pool")
 
 
 def cmd_remove(cfg, args):
     require_root()
     pool = Pool(cfg)
     if not pool.is_mounted():
-        raise BraidError(f"{cfg['mountpoint']} がマウントされていません")
+        raise BraidError(f"{cfg['mountpoint']} is not mounted")
     if pool.balance_running():
-        raise BraidError("balance 実行中です。完了後にやり直してください")
+        raise BraidError("a balance is running; try again once it finishes")
     report = collect(pool)
     if args.target == "missing":
         if not report.gone:
-            raise BraidError("欠けているデバイスはありません")
+            raise BraidError("no missing devices")
         target, losing = "missing", report.gone
     else:
         d = resolve_target(pool, args.target)
@@ -692,18 +700,18 @@ def cmd_remove(cfg, args):
     names = ", ".join(f"devid {d.devid} ({d.name}, {fmt_bytes(d.size)})" for d in losing)
     if not ok:
         short = needed / cfg["rebuild_margin"] - after
-        raise BraidError(f"{names} を外すと残りに収まりません "
-                         f"(外した後の使える容量 {fmt_bytes(after)} < 使用 {fmt_bytes(needed)})。"
-                         f"先に {fmt_bytes(short)} 以上のドライブを追加してください")
-    print(f"== {names} を外します (外した後の使える容量 {fmt_bytes(after)}、使用 {fmt_bytes(needed)})")
-    print("   データを他のドライブへ移すため時間がかかります (Ctrl-C しても btrfs 側の処理は続きます)")
+        raise BraidError(f"removing {names} would not leave room for the data "
+                         f"(usable afterwards {fmt_bytes(after)} < used {fmt_bytes(needed)}). "
+                         f"Add at least {fmt_bytes(short)} first")
+    print(f"== removing {names} (usable afterwards {fmt_bytes(after)}, used {fmt_bytes(needed)})")
+    print("   data is relocated first, so this takes a while (btrfs keeps going if you Ctrl-C)")
     pool.compact()
     p = pool.remove_device(target, stream=True)
     if p.returncode != 0:
-        raise BraidError(f"btrfs device remove が失敗しました (exit {p.returncode})。"
-                         "ENOSPC の場合は残りドライブの未割当領域が足りません: "
-                         f"`btrfs balance start --full-balance {cfg['mountpoint']}` 後に再試行するか、ドライブを追加してください")
-    print("== 完了")
+        raise BraidError(f"btrfs device remove failed (exit {p.returncode}). "
+                         "If it was ENOSPC, the remaining drives lack unallocated space: run "
+                         f"`btrfs balance start --full-balance {cfg['mountpoint']}` and retry, or add a drive")
+    print("== done")
     print(render_status(collect(pool), cfg))
 
 
@@ -723,59 +731,62 @@ def describe(dev, state):
 
 
 def ensure_mounted(cfg, pool, notifier, state):
-    """未マウントなら通常マウント → 駄目なら縮退マウント。戻り値: マウントできたか"""
+    """Mount normally, else degraded. Returns whether the pool ended up mounted."""
     if pool.is_mounted():
         return True
     present = pool.member_devices_present()
     if not present:
         if state.should_notify("no-members", cfg["remind_interval_sec"]):
-            notifier.send("プールのドライブが 1 台も見えません",
-                          f"{cfg['mountpoint']} は未マウントで、LABEL={cfg['label']} の btrfs メンバーが見つかりません。\n"
-                          "USB ハブ・電源を確認してください。")
+            notifier.send("No pool drives are visible",
+                          f"{cfg['mountpoint']} is not mounted and no btrfs member with "
+                          f"LABEL={cfg['label']} can be found.\nCheck the USB hub and power.")
         return False
     p = pool.mount(check=False)
     if p.returncode == 0:
-        LOG.info("通常マウントに成功")
+        LOG.info("mounted normally")
         state.clear_notify("no-members")
         return True
-    LOG.warning("通常マウント失敗: %s — 縮退マウントを試みます", p.stderr.strip())
+    LOG.warning("normal mount failed: %s — trying degraded", p.stderr.strip())
     p = pool.mount(degraded=True, check=False)
     if p.returncode != 0:
         if state.should_notify("mount-failed", cfg["remind_interval_sec"]):
-            notifier.send("プールをマウントできません",
-                          f"通常マウントも縮退マウントも失敗しました。\n見えているメンバー: {', '.join(present)}\n\n{p.stderr}")
+            notifier.send("Cannot mount the pool",
+                          f"Both a normal and a degraded mount failed.\n"
+                          f"Members visible: {', '.join(present)}\n\n{p.stderr}")
         return False
-    notifier.send("縮退状態でマウントしました",
-                  f"{cfg['mountpoint']} を 1 台欠けた状態 (degraded) でマウントしました。\n"
-                  f"見えているメンバー: {', '.join(present)}\n"
-                  f"{cfg['debounce_sec']} 秒以内にドライブが戻らなければ、容量が足りる場合は自動で再冗長化します。")
+    notifier.send("Mounted degraded",
+                  f"{cfg['mountpoint']} was mounted with a drive missing (degraded).\n"
+                  f"Members visible: {', '.join(present)}\n"
+                  f"If the drive does not return within {cfg['debounce_sec']} seconds, the pool will be "
+                  "re-protected automatically provided the remaining capacity is sufficient.")
     return True
 
 
 def rebuild_missing(cfg, pool, notifier, state, report):
-    """欠けたデバイスを外して残りで raid1 を組み直す（Drobo の再レイアウト相当）"""
+    """Evict the missing devices and restore raid1 across the survivors (Drobo's re-layout)"""
     gone = report.gone
     names = "\n".join("  - " + describe(d, state) for d in gone)
     ok, after, needed = can_rebuild(report, cfg)
     state.data["rebuild"] = {"started": time.time(), "devids": [d.devid for d in gone]}
     state.save()
-    notifier.send("自動再冗長化を開始します",
-                  f"欠けたドライブ:\n{names}\n\n残り {len(report.devs) - len(gone)} 台で再冗長化します。\n"
-                  f"外した後の使える容量 {fmt_bytes(after)} / 使用 {fmt_bytes(needed)}\n"
-                  "完了まで時間がかかります。完了時に再度通知します。")
+    notifier.send("Starting automatic re-protection",
+                  f"Missing drive(s):\n{names}\n\n"
+                  f"Re-protecting across the remaining {len(report.devs) - len(gone)} drive(s).\n"
+                  f"Usable afterwards {fmt_bytes(after)} / used {fmt_bytes(needed)}\n"
+                  "This takes a while; you will get another message when it finishes.")
     try:
         pool.compact()
-        # 1) ライブのまま devid 指定で外せるか試す（カーネルが missing を把握している場合）
+        # 1) Try removing by devid on the live filesystem (works when the kernel tracks the loss)
         live_ok = True
         for d in gone:
             p = pool.remove_device(d.devid)
             if p.returncode != 0:
-                LOG.info("ライブでの remove 失敗 (devid %d): %s", d.devid, (p.stderr or p.stdout).strip())
+                LOG.info("live remove failed (devid %d): %s", d.devid, (p.stderr or p.stdout).strip())
                 live_ok = False
                 break
-        # 2) 駄目なら短時間止めて縮退再マウント → remove missing
+        # 2) Otherwise take the brief downtime: remount degraded and remove missing
         if not live_ok:
-            LOG.info("縮退再マウントに切り替え: %s 停止", cfg["samba_units"])
+            LOG.info("falling back to degraded remount; stopping %s", cfg["samba_units"])
             for u in cfg["samba_units"]:
                 run(["systemctl", "stop", u], check=False)
             try:
@@ -788,14 +799,15 @@ def rebuild_missing(cfg, pool, notifier, state, report):
                 p = pool.remove_device("missing")
                 if p.returncode != 0:
                     raise BraidError(f"btrfs device remove missing: {(p.stderr or p.stdout).strip()}")
-        # 3) 縮退中に作られた不完全チャンクがあれば raid1 に揃える
+        # 3) Anything written single-copy while degraded goes back to raid1
         if pool.usage().multiple_profiles:
-            LOG.info("複数プロファイル検出 → soft convert balance")
+            LOG.info("multiple profiles present -> soft convert balance")
             pool.balance_soft_convert()
     except BraidError as e:
         state.data["rebuild"] = None
         state.save()
-        notifier.send("自動再冗長化に失敗しました", f"{e}\n\nプールは縮退状態のまま動作しています。手動確認が必要です:\n"
+        notifier.send("Automatic re-protection failed",
+                      f"{e}\n\nThe pool is still running, degraded. It needs attention:\n"
                       f"  sudo braidctl status\n  sudo btrfs device remove missing {cfg['mountpoint']}")
         return
     for d in gone:
@@ -804,14 +816,15 @@ def rebuild_missing(cfg, pool, notifier, state, report):
     state.data["rebuild"] = None
     state.save()
     new = collect(pool)
-    notifier.send("自動再冗長化が完了しました",
-                  f"外したドライブ:\n{names}\n\n" + render_status(new, cfg, state))
+    notifier.send("Automatic re-protection complete",
+                  f"Removed:\n{names}\n\n" + render_status(new, cfg, state))
 
 
 def reattach(cfg, pool, notifier, state, returned):
-    """一時的に外れていたメンバーが戻ってきた: 再マウントで組み戻し、古くなったコピーを scrub で同期する"""
+    """A member that was only temporarily absent came back: remount to pick it up,
+    then scrub so the copies it missed get rewritten."""
     names = ", ".join(f"devid {devid} ({os.path.basename(p)})" for p, devid in returned)
-    LOG.info("復帰したメンバーを組み戻します: %s", names)
+    LOG.info("re-attaching returned member(s): %s", names)
     for u in cfg["samba_units"]:
         run(["systemctl", "stop", u], check=False)
     try:
@@ -819,10 +832,10 @@ def reattach(cfg, pool, notifier, state, returned):
         for p, _ in returned:
             run(["btrfs", "device", "scan", p], check=False)
         if pool.mount(check=False).returncode != 0:
-            LOG.warning("通常マウント失敗 → 縮退マウント")
+            LOG.warning("normal mount failed -> degraded")
             pool.mount(degraded=True)
     except BraidError as e:
-        notifier.send("復帰したドライブの組み戻しに失敗しました", f"{names}\n{e}")
+        notifier.send("Failed to re-attach a returned drive", f"{names}\n{e}")
         return False
     finally:
         for u in cfg["samba_units"]:
@@ -830,16 +843,17 @@ def reattach(cfg, pool, notifier, state, returned):
     new = collect(pool)
     still = {d.devid for d in new.gone} & {devid for _, devid in returned}
     if still:
-        notifier.send("復帰したドライブを組み戻せませんでした",
-                      f"{names} のうち devid {sorted(still)} はまだ欠けたままです。\n\n" + render_status(new, cfg, state))
+        notifier.send("Could not re-attach a returned drive",
+                      f"Of {names}, devid {sorted(still)} is still missing.\n\n"
+                      + render_status(new, cfg, state))
         return False
     for _, devid in returned:
         state.data["missing"].pop(str(devid), None)
     state.clear_notify("cannot-rebuild")
-    # 外れていた間に書かれたデータはそのドライブに無いので、scrub でミラーから補完する
+    # Whatever was written while it was away is not on it; scrub rewrites it from the mirror
     run(["btrfs", "scrub", "start", cfg["mountpoint"]], check=False)
-    notifier.send("ドライブが復帰しました (組み戻し完了)",
-                  f"{names} をプールに戻しました。外れていた間の差分を scrub で同期しています。\n\n"
+    notifier.send("Drive returned and was re-attached",
+                  f"{names} is back in the pool. A scrub is running to resync what it missed.\n\n"
                   + render_status(new, cfg, state))
     return True
 
@@ -861,36 +875,38 @@ def cmd_monitor(cfg, args):
     update_inventory(state, report.devs)
     missing = state.data["missing"]
 
-    # --- 一時的に外れたメンバーが戻ってきた → 再構築せず組み戻す ---
+    # --- a member that was only temporarily absent came back: re-attach, do not rebuild ---
     returned, stale = pool.returned_members(report)
     if returned and not report.balance_running and state.data.get("rebuild") is None:
         if reattach(cfg, pool, notifier, state, returned):
             report = collect(pool)
     for p, devid in stale:
         if state.should_notify(f"stale-{p}", cfg["remind_interval_sec"]):
-            notifier.send("古いメンバーのドライブが接続されています",
-                          f"{p} (旧 devid {devid}) は既にプールから外されたドライブです。\n"
-                          f"再利用するなら: sudo braidctl add --force {p}")
+            notifier.send("A previously removed drive is attached",
+                          f"{p} (formerly devid {devid}) was already evicted from the pool.\n"
+                          f"To reuse it: sudo braidctl add --force {p}")
 
-    # --- 脱落 (デバイスが消えた) ---
+    # --- losses ---
     gone_ids = {str(d.devid) for d in report.gone}
     for d in report.gone:
         key = str(d.devid)
         if key not in missing:
             missing[key] = now
-            notifier.send("ドライブの脱落を検知しました",
-                          f"{describe(d, state)} が見えなくなりました。\n"
-                          f"{int(debounce)} 秒待って戻らなければ、容量が足りる場合は自動で再冗長化します。\n\n"
+            notifier.send("Drive lost",
+                          f"{describe(d, state)} disappeared.\n"
+                          f"If it does not return within {int(debounce)} seconds, the pool will be "
+                          "re-protected automatically provided the remaining capacity is sufficient.\n\n"
                           + render_status(report, cfg, state))
     for key in list(missing):
         if key not in gone_ids:
-            LOG.info("devid %s が復帰", key)
+            LOG.info("devid %s is back", key)
             del missing[key]
-            notifier.send("ドライブが復帰しました", f"devid {key} が再び見えています。再構築は行いません。\n\n"
+            notifier.send("Drive is back",
+                          f"devid {key} is visible again. No rebuild will be performed.\n\n"
                           + render_status(report, cfg, state))
-            state.clear_notify(f"cannot-rebuild")
+            state.clear_notify("cannot-rebuild")
 
-    # --- エラーカウンタ / SMART ---
+    # --- error counters / SMART ---
     base = state.data["err_base"]
     failing = []
     for d in report.devs:
@@ -901,13 +917,14 @@ def cmd_monitor(cfg, args):
         delta = {k: v - prev.get(k, 0) for k, v in d.errors.items() if v - prev.get(k, 0) > 0}
         base[key] = d.errors
         if delta and state.should_notify(f"errors-{key}", cfg["remind_interval_sec"]):
-            notifier.send("ドライブの I/O エラーが増えています",
+            notifier.send("I/O errors are increasing on a drive",
                           f"{describe(d, state)}: " + ", ".join(f"{k}+{v}" for k, v in delta.items())
-                          + f"\n累計: {d.errors}\nSMART: {d.smart}")
+                          + f"\nTotals: {d.errors}\nSMART: {d.smart}")
         if sum(delta.values()) >= cfg["error_threshold"]:
             failing.append(d)
-        # SMART: 健康判定 FAIL、保留セクタあり、再割当セクタが前回より増えた、のいずれかで警告。
-        # 古いドライブの「再割当 1 個で安定」を毎日警告しないよう、再割当は増分で見る
+        # Warn on a SMART failure, pending/uncorrectable sectors, or a reallocation count that grew.
+        # Reallocations are compared against the last reading so an old drive sitting at a stable
+        # count is not an alarm every single day.
         s = d.smart
         sbase = state.data.setdefault("smart_base", {})
         prev_realloc = sbase.get(key, {}).get("reallocated")
@@ -918,21 +935,22 @@ def cmd_monitor(cfg, args):
         smart_bad = s and (s.get("passed") is False or (s.get("pending") or 0) > 0
                            or (s.get("offline_uncorr") or 0) > 0 or grew)
         if smart_bad and state.should_notify(f"smart-{key}", cfg["remind_interval_sec"]):
-            notifier.send("SMART が劣化を示しています",
+            notifier.send("SMART reports a degrading drive",
                           f"{describe(d, state)}: {s}\n"
-                          + (f"再割当セクタが {prev_realloc} → {realloc} に増えました。\n" if grew else "")
-                          + "早めに `braidctl remove` で外して交換することを勧めます。")
+                          + (f"Reallocated sectors went from {prev_realloc} to {realloc}.\n" if grew else "")
+                          + "Consider removing it with `braidctl remove` and replacing it soon.")
 
-    # --- 自動再冗長化 ---
+    # --- automatic re-protection ---
     expired = [d for d in report.gone if now - missing.get(str(d.devid), now) >= debounce]
     if cfg["auto_evict_on_errors"] and failing and not report.gone:
-        # 生きているが壊れかけ: ライブで外す（読めない部分はミラーから読まれる）
+        # Failing but present: remove it live; unreadable parts come from the mirror
         d = failing[0]
         ok, after, needed = can_rebuild(report, cfg, losing=[d])
         if ok:
-            notifier.send("故障しかけのドライブを自動で外します", f"{describe(d, state)}\n外した後の使える容量 {fmt_bytes(after)}")
+            notifier.send("Evicting a failing drive automatically",
+                          f"{describe(d, state)}\nUsable afterwards {fmt_bytes(after)}")
             p = pool.remove_device(d.devid)
-            notifier.send("自動退避 " + ("完了" if p.returncode == 0 else "失敗"),
+            notifier.send("Automatic eviction " + ("complete" if p.returncode == 0 else "failed"),
                           (p.stderr or p.stdout or "") + "\n\n" + render_status(collect(pool), cfg, state))
     elif expired and not report.balance_running:
         ok, after, needed = can_rebuild(report, cfg)
@@ -941,19 +959,20 @@ def cmd_monitor(cfg, args):
             report = collect(pool)
         elif state.should_notify("cannot-rebuild", cfg["remind_interval_sec"]):
             short = needed / cfg["rebuild_margin"] - after
-            notifier.send("ドライブの追加が必要です (再冗長化できません)",
-                          f"欠けたドライブ:\n" + "\n".join("  - " + describe(d, state) for d in expired)
-                          + f"\n\n残りの使える容量 {fmt_bytes(after)} < 使用 {fmt_bytes(needed)} のため、"
-                          f"このままでは冗長性を回復できません。\n"
-                          f"あと {fmt_bytes(short)} 分のドライブを追加してください: sudo braidctl add /dev/sdX\n"
-                          "データは現在も読み書きできますが、もう 1 台失うと消えます。\n\n"
+            notifier.send("Drive addition required (cannot re-protect)",
+                          "Missing drive(s):\n"
+                          + "\n".join("  - " + describe(d, state) for d in expired)
+                          + f"\n\nRemaining usable capacity {fmt_bytes(after)} is less than the "
+                          f"{fmt_bytes(needed)} in use, so redundancy cannot be restored as things stand.\n"
+                          f"Add at least {fmt_bytes(short)} more: sudo braidctl add /dev/sdX\n"
+                          "The data is still readable and writable, but losing one more drive loses it.\n\n"
                           + render_status(report, cfg, state))
 
-    # --- 容量警告 ---
+    # --- capacity ---
     u = report.usage
     pct = (u.used / u.usable * 100) if u.usable else 0
     if pct >= cfg["warn_percent"] and state.should_notify("capacity", cfg["remind_interval_sec"]):
-        notifier.send(f"プールの使用率が {pct:.0f}% です", render_status(report, cfg, state))
+        notifier.send(f"Pool is {pct:.0f}% full", render_status(report, cfg, state))
     elif pct < cfg["warn_percent"]:
         state.clear_notify("capacity")
 
@@ -969,10 +988,10 @@ def cmd_scrub(cfg, args):
     pool = Pool(cfg)
     notifier = Notifier(cfg)
     if not pool.is_mounted():
-        raise BraidError(f"{cfg['mountpoint']} がマウントされていません")
+        raise BraidError(f"{cfg['mountpoint']} is not mounted")
     if "running" in pool.scrub_status():
-        raise BraidError("scrub は既に実行中です")
-    LOG.info("scrub 開始")
+        raise BraidError("a scrub is already running")
+    LOG.info("scrub starting")
     p = run(["btrfs", "scrub", "start", "-B", "-d", cfg["mountpoint"]], check=False)
     status = pool.scrub_status()
     errs = re.search(r"Error summary:\s+(.*)", status)
@@ -980,11 +999,11 @@ def cmd_scrub(cfg, args):
     ok = p.returncode == 0 and (summary.startswith("no errors") or summary == "")
     body = f"exit={p.returncode}\n{p.stdout}\n{status}"
     if ok:
-        LOG.info("scrub 完了: %s", summary)
+        LOG.info("scrub finished: %s", summary)
         if not args.quiet:
-            notifier.send("scrub 完了 (エラーなし)", body)
+            notifier.send("Scrub finished, no errors", body)
     else:
-        notifier.send("scrub でエラーが見つかりました", body)
+        notifier.send("Scrub found errors", body)
         sys.exit(1)
 
 
@@ -992,13 +1011,13 @@ def cmd_mount_degraded(cfg, args):
     require_root()
     pool = Pool(cfg)
     if pool.is_mounted():
-        print("既にマウントされています")
+        print("already mounted")
         return
     present = pool.member_devices_present()
     if not present:
-        raise BraidError(f"LABEL={cfg['label']} のメンバーが 1 台も見えません")
+        raise BraidError(f"no members with LABEL={cfg['label']} are visible")
     pool.mount(degraded=True)
-    print(f"縮退マウントしました (メンバー: {', '.join(present)})")
+    print(f"mounted degraded (members: {', '.join(present)})")
     print(render_status(collect(pool), cfg))
 
 
@@ -1011,28 +1030,29 @@ def main(argv=None):
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("status", help="プールの状態")
+    s = sub.add_parser("status", help="pool capacity, protection state and drive health")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("add", help="ドライブを追加")
+    s = sub.add_parser("add", help="add a drive to the pool")
     s.add_argument("device")
-    s.add_argument("--force", action="store_true", help="既存の署名・パーティションを消して追加")
+    s.add_argument("--force", action="store_true", help="erase existing signatures and partitions first")
     s.set_defaults(fn=cmd_add)
 
-    s = sub.add_parser("remove", help="ドライブを外す (devid / デバイスパス / missing)")
+    s = sub.add_parser("remove", help="remove a drive (devid, device path, or 'missing')")
     s.add_argument("target")
     s.set_defaults(fn=cmd_remove)
 
-    s = sub.add_parser("monitor", help="検知と自動再冗長化 (timer 用)")
-    s.add_argument("--debounce", type=int, default=None, help="秒 (設定値を上書き。検証用)")
+    s = sub.add_parser("monitor", help="detect losses and re-protect automatically (for the timer)")
+    s.add_argument("--debounce", type=int, default=None,
+                   help="seconds; overrides the configured value (for testing)")
     s.set_defaults(fn=cmd_monitor)
 
-    s = sub.add_parser("scrub", help="全データ検証")
-    s.add_argument("--quiet", action="store_true", help="成功時は通知しない")
+    s = sub.add_parser("scrub", help="verify every block against its checksum")
+    s.add_argument("--quiet", action="store_true", help="do not notify on success")
     s.set_defaults(fn=cmd_scrub)
 
-    s = sub.add_parser("mount-degraded", help="1 台欠けた状態で縮退マウント")
+    s = sub.add_parser("mount-degraded", help="mount with a drive missing")
     s.set_defaults(fn=cmd_mount_degraded)
 
     args = ap.parse_args(argv)

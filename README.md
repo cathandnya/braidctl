@@ -1,120 +1,197 @@
-# braid — btrfs raid1 の上に Drobo BeyondRAID 風の運用層を載せる
+# braidctl
 
-Drobo の BeyondRAID がやっていたこと:
+Drobo BeyondRAID-style storage pool management for btrfs RAID1 on Linux.
 
-1. 容量の異なるドライブを束ねて 1 つのプールにする
-2. 実容量 / 使える容量 / 使用量 を表示する
-3. ドライブが抜けたり壊れたりしたら、残りの「使える容量」に収まる限り自動で冗長性を回復する
-4. ドライブを追加・削除したら適切に再配置する
-
-1 と 4、および 3 の「仕組み」は btrfs の raid1 プロファイルが既に持っている（チャンク単位の 2 重化、
-容量混在、オンラインでの device add/remove）。このリポジトリの `braidctl` は、Drobo が
-ファームウェアでやっていた残りの部分 — 表示・検知・自動復旧・安全装置 — を担当する。
+Mix drives of any size into one pool, see a single honest "usable capacity" number, and — when a
+drive dies — get your redundancy back **automatically, without plugging in a replacement drive**.
 
 ```
-/dev/sdd /dev/sde /dev/sdf /dev/sdg      容量はバラバラでよい
-        └ btrfs LABEL=braid -d raid1 -m raid1  →  /srv/pool
-                ├ share/          Samba [pool]
-                └ timemachine/    Samba [timemachine]
+$ sudo braidctl status
+braid  /srv/pool   PROTECTED (RAID1)
+Raw    7.50 TB   Usable    3.75 TB   Used  412.31 GB (11%)   Free    3.34 TB
 
-braidctl  ─ status   実容量 / 使える容量 / 使用量 / 保護状態 / 各ドライブ (SMART・エラー)
-          ─ add      空ドライブ検査 → device add → balance
-          ─ remove   外した後も収まるか試算 → device remove
-          ─ monitor  5 分毎 (timer)。脱落・故障の検知 → 猶予 → 自動再冗長化 or 通知
-          ─ scrub    月次 (timer)。全データをチェックサムで検証・修復
+ID  device   model                       size     alloc  errors  health
+ 1  sdd      ThinkPlus                2.00 TB 206.16 GB       0  OK 40°C
+ 2  sde      ThinkPlus                2.00 TB 204.03 GB       0  OK 41°C
+ 3  sdf      WDC WD25EZRX-00MMMB0     2.50 TB 309.24 GB       0  OK 47°C
+ 4  sdg      WDC WD10EADS-00L5B1      1.00 TB 105.19 GB       0  WARN reallocated=1 44°C
+
+Any single drive can be lost and re-protected (losing the largest, sdf 2.50 TB,
+leaves 2.50 TB usable >= 412.31 GB used)
 ```
 
-## 使える容量の考え方
+## Why
 
-raid1 は全チャンクを 2 台に置くので、使える容量は理想的には
+[Drobo](https://en.wikipedia.org/wiki/Drobo) was liquidated in 2023 with no successor. Three things
+made BeyondRAID pleasant to live with:
 
-    usable = min( 合計 / 2 ,  合計 − 最大ドライブ )
+1. **Any drives, any sizes.** Add a drive you had lying around. Pull one out. Nothing has to match.
+2. **One number.** Not "7.5 TB raw across 4 disks in a 2-way mirror" — just *how much can I store*.
+3. **Self-healing without a spare.** Lose a drive and the array re-lays-out its data across the
+   drives that are left. If what you're storing still fits, you are fully redundant again — before
+   you have even ordered a replacement.
 
-例: 1.82 + 1.82 + 2.27 + 0.91 = 6.82 TB → usable ≈ 3.4 TB。
-`status` の「使える容量」は理想値ではなく btrfs の実測 (`Free (estimated)` + 使用量) を使う。
-「あるドライブを失ったときに再冗長化できるか」は、残りのドライブで上式を計算し
-`使用量 <= usable_after × rebuild_margin (0.95)` で判定する。Drobo の緑/黄/赤ランプに相当。
+btrfs already implements the hard part of (1) and (3): its `raid1` profile mirrors in 1 GiB chunks
+rather than whole disks, so member drives can be any size, and `device add` / `device remove`
+re-place those chunks online. What's missing is everything Drobo did in firmware around it: the
+capacity display, failure detection, the decision of *whether* a rebuild is even possible, and
+actually pulling the trigger. That layer is `braidctl`.
 
-## 自動再冗長化の流れ (monitor)
+## What btrfs gives you vs. what braidctl adds
+
+| | btrfs | braidctl |
+|---|---|---|
+| Mixed-size drives, chunk-level mirroring | ✅ | |
+| Online `device add` / `device remove` | ✅ | |
+| Checksums, scrub, self-healing reads | ✅ | |
+| "How much can I actually store?" | `btrfs fi usage`, if you know how to read it | one line, plus per-drive *survivability* |
+| Notices a drive vanished | an error in `dmesg` | polls, debounces, and tells you |
+| Rebuilds after a failure | you type the commands | automatic, if capacity allows |
+| Decides a rebuild is *impossible* | — | says so, and tells you how many GB to add |
+| Mounts a degraded pool at boot | mount just fails | falls back to `-o degraded` and reports |
+| Refuses to eat the wrong disk | `device add` will happily take your system disk | multiple interlocks |
+
+## Usable capacity
+
+With two copies of everything, the ideal usable capacity of a set of drives is
 
 ```
-ドライブが消えた
-  → 即通知「脱落を検知。N 秒待つ」          (state.json に初回検知時刻)
-  → debounce_sec (既定 600 秒) の間に戻ったら
-        再マウントで組み戻し + scrub で差分同期   ← USB 瞬断・抜き差し
-  → 戻らなければ usable_after を計算
-        収まる  → compaction balance → btrfs device remove <devid>
-                   (ライブで外せなければ smbd を止めて degraded 再マウント → remove missing)
-                 → 完了通知。プールは残りのドライブで再び PROTECTED
-        収まらない → 「あと X GB 分のドライブを追加してください」を通知 (1 日 1 回リマインド)
-                     データは読み書きできるが、もう 1 台失うと消える
-起動時に 1 台欠けていた
-  → fstab の通常マウントは失敗する (nofail で起動は続く)
-  → monitor (OnBootSec=3min) が degraded でマウントして通知 → 以降は上と同じ
+usable = min( sum(sizes) / 2 ,  sum(sizes) - max(size) )
 ```
 
-生きているがエラーが増えているドライブは既定では通知のみ (`auto_evict_on_errors = true` で自動退避)。
+The second term is the one people forget: a 4 TB drive among three 1 TB drives can only ever be
+half-used, because there is nothing big enough to hold the other copy. `braidctl status` reports
+btrfs's measured figure rather than this ideal, but uses the formula to answer the question that
+actually matters — *if this drive dies, can the rest still hold my data?* — for every drive in the
+pool. That is the last line of `status`, and it is the difference between a green light and a red one.
 
-## 安全装置
+## When a drive dies
 
-- `/srv/pool` は `chattr +i`。未マウント時に Samba/Time Machine がルート FS へ書き込むのを防ぐ
-- `add` はシステムディスク・マウント中・LUKS 等の holder 付き・`protected_devices` を常に拒否。
-  署名やパーティションがあるドライブは `--force` が無ければ拒否
-- `remove` は外した後の容量を試算し、収まらなければ拒否
-- 一度外し終えた古いメンバーを挿すと「古いメンバーです。add --force で再利用」と通知するだけで、勝手には触らない
-- balance 実行中は add/remove/再構築を始めない。monitor は flock で多重実行しない
+```
+drive disappears
+  └─ notify "drive lost, waiting N seconds"                 (records first-seen-missing time)
+     ├─ comes back within debounce_sec (default 600)
+     │    └─ remount to re-attach it, then scrub to resync what it missed
+     └─ still gone
+          ├─ remaining drives can hold the data
+          │    └─ compaction balance → btrfs device remove <devid>
+          │       (if the kernel won't do that live: stop Samba, remount -o degraded,
+          │        remove missing, restart Samba — tens of seconds of downtime)
+          │    └─ notify "re-protected". Pool is PROTECTED again on fewer drives.
+          └─ they can't
+               └─ notify "add %s more of drive" — repeated daily, Drobo's red light.
+                  Data stays readable and writable. It is simply no longer redundant.
+```
 
-## インストール
+At boot with a drive missing, the normal `fstab` mount fails (harmlessly, thanks to `nofail`) and
+the monitor mounts the pool `-o degraded` three minutes in, then follows the same path.
+
+A drive that is dying rather than dead — SMART failures, pending sectors, a rising btrfs error
+counter — is reported but not acted on, because pulling a drive that still serves reads is usually
+worse than keeping it. Set `auto_evict_on_errors = true` if you disagree.
+
+## Install
+
+Requirements: Linux with systemd, btrfs-progs, Python 3.11+ (for `tomllib`), and `smartctl` for
+health reporting. No Python packages — the tool is a single stdlib-only file.
 
 ```bash
-sudo ~/rc/braid/install.sh          # /usr/local/sbin/braidctl, /etc/braid/braid.toml, timer 有効化
+git clone https://github.com/cathandnya/braidctl
+sudo braidctl/install.sh        # /usr/local/sbin/braidctl, /etc/braid/braid.toml, systemd timers
+```
+
+Then create a pool, if you don't have one — **this erases the drives**:
+
+```bash
+sudo mkfs.btrfs -L braid -d raid1 -m raid1 /dev/sdX /dev/sdY /dev/sdZ
+echo 'LABEL=braid /srv/pool btrfs noatime,nofail,x-systemd.device-timeout=120 0 0' | sudo tee -a /etc/fstab
+sudo mkdir -p /srv/pool && sudo chattr +i /srv/pool   # see "Safety" below
+sudo systemctl daemon-reload && sudo mount /srv/pool
 sudo braidctl status
 ```
 
-初回構築 (既存 mergerfs プールの解体を含む) は `rebuild-pool.sh`。データは消える。
+The pool's filesystem label, the config directory and the systemd units are all named `braid` — the
+pool. `braidctl` is the command that manages it. Edit `/etc/braid/braid.toml` if your mount point,
+label, or the services to pause during a rebuild differ from the defaults.
 
-## 日常の操作
-
-```bash
-sudo braidctl status                 # 状態
-sudo braidctl add /dev/sdX           # 追加 (空ドライブ)。中身があれば --force
-sudo braidctl remove 3               # devid 3 を外す (容量が足りるときだけ)
-sudo braidctl remove /dev/sdg        # パスでも可
-sudo braidctl remove missing         # 欠けたドライブを手動で外す (monitor が自動でやるのと同じ)
-sudo braidctl scrub                  # 手動 scrub
-sudo braidctl mount-degraded         # 1 台欠けた状態で手動マウント
-journalctl -u braid-monitor -n 50    # monitor のログ
-```
-
-故障ドライブの交換 = 「monitor が自動で外す (or `remove`)」→「新しいドライブを `add`」の 2 手。
-Drobo と同じく、交換前に残りの容量で冗長性が回復しているので急ぐ必要はない。
-
-## 検証方法
-
-ループデバイスで一通り再現できる (`~/.cache/braid-test` に 10G/10G/15G/5G の疎ファイル):
+## Commands
 
 ```bash
-sudo losetup -f a.img ... ; sudo mkfs.btrfs -L braidtest -d raid1 -m raid1 /dev/loop3..6
-# test.toml: mountpoint/label/state_file を試験用に、debounce_sec=5, samba_units=[], notify.config_file を存在しないパスに
-sudo umount mnt; sudo losetup -d /dev/loop6            # 脱落を模擬
-sudo braidctl -c test.toml monitor                     # degraded マウント + 検知
-sudo braidctl -c test.toml monitor --debounce 0        # 自動再冗長化 or 「追加が必要」
-sudo losetup -f d.img; sudo udevadm trigger /dev/loop6 # 復帰を模擬 → 組み戻し + scrub
+sudo braidctl status              # capacity, protection state, per-drive health
+sudo braidctl status --json       # same, for scripts
+sudo braidctl add /dev/sdX        # add a drive (refuses one with data unless --force), then balance
+sudo braidctl remove 3            # remove devid 3 — only if what's left can still hold the data
+sudo braidctl remove /dev/sdg     # by path
+sudo braidctl remove missing      # evict a dead drive by hand (what monitor does for you)
+sudo braidctl monitor             # one detection pass; run from the timer every 5 minutes
+sudo braidctl scrub               # verify every block against its checksum
+sudo braidctl mount-degraded      # mount with a drive missing, by hand
 ```
 
-実機 (USB) では `echo 1 | sudo tee /sys/block/sdX/device/delete` で 1 台だけ抜線と同じ状態にできる
-(`/sys/bus/usb/drivers/usb/unbind` は同じ筐体の 2 台がまとめて消えるので使わない)。
-復帰は `echo '- - -' | sudo tee /sys/class/scsi_host/hostN/scan`。
+Replacing a failed drive is therefore: nothing (the monitor evicts it and re-protects the pool),
+then `braidctl add` when the new drive arrives. There is no "rebuild window" to sweat through,
+because the rebuild already happened.
 
-## 制約・注意
+Notifications go out by email. By default `braidctl` borrows the SMTP block from an existing
+nas-monitor-style config; point `notify.config_file` at any JSON
+file with a `notification.email` object of `{smtp_server, smtp_port, username, password, from, to,
+use_tls}`. Without one, everything still lands in the journal — `journalctl -u braid-monitor`.
 
-- **2 重化 (raid1) なので同時 2 台故障には耐えない。** galbo の 4 台は 2 台ずつ同じ USB 筐体
-  (ThinkPlus ×2 = 1 台の USB デバイス、WDC ×2 = 1 台の USB デバイス) に入っており、
-  **筐体 1 つの故障・抜線 = 2 台同時喪失** になる。btrfs は筐体を区別してコピーを置かないので、
-  この構成では筐体障害でデータを失いうる。対策は raid1c3 (3 重化、効率 33%:
-  `btrfs balance start -dconvert=raid1c3 -mconvert=raid1c3 /srv/pool`) か、筐体を分けること
-- 自動再冗長化の途中で degraded 再マウントが必要になった場合、その間 (数十秒) smbd を止める
-- 再構築 (device remove) と balance は USB バス帯域を使うので、その間 Time Machine は遅くなる
-- 再冗長化後もマウントオプションに `degraded` が残ることがある。無害で、次の再マウント/再起動で消える
-- 容量が 90% を超えると balance/remove が ENOSPC で失敗しやすい。`status` が警告する
-- Drobo と同じく、表示は 10 進 (1 TB = 10^12 B)。`df` の TiB より数字が大きく見える
+## Safety
+
+Destroying an array by mistyping a device node is a real risk for a tool like this, so:
+
+- **`add` refuses** the system disk, anything mounted, anything with a holder (LUKS, LVM, MD),
+  anything matching `protected_devices`, and — without `--force` — anything carrying a filesystem
+  signature or partitions.
+- **`remove` refuses** if the remaining drives couldn't hold the data, and says how much to add.
+- **A returning drive is never silently re-added.** If it still belongs to the pool it is
+  re-attached and resynced; if it was already evicted, you get a note suggesting `add --force`,
+  and nothing is touched.
+- **The mount point is immutable.** `chattr +i /srv/pool` means that if the pool is *not* mounted,
+  writes to that path fail instead of quietly filling your root filesystem — a classic way to lose
+  a NAS's data to a full `/`.
+- **One mutation at a time.** `monitor` holds a lock; `add`/`remove` refuse while a balance runs.
+- **Rebuilds are debounced.** A USB bus glitch that clears in seconds must not trigger a re-layout.
+
+## Limitations
+
+- **`raid1` means two copies, not two *drives* of tolerance.** Any single drive can die. Two cannot.
+  Note that several USB enclosures present two disks as one device — if that enclosure fails, you
+  lose both, and btrfs has no idea they were related. Either split them across enclosures, or use
+  three copies: `btrfs balance start -dconvert=raid1c3 -mconvert=raid1c3 /srv/pool` (usable capacity
+  drops to roughly a third of raw). `braidctl` reports and rebuilds `raid1c3` pools too.
+- `raid5`/`raid6` are deliberately unsupported: btrfs's parity RAID still has the write hole.
+- A rebuild that needs the degraded-remount fallback interrupts file sharing for tens of seconds.
+- Rebuilds and balances are I/O-heavy; on USB, everything else gets slow while they run.
+- Above ~90% full, `balance` and `device remove` start failing with `ENOSPC`. `status` warns.
+- The pool may keep the `degraded` mount option after a successful rebuild until it's next
+  remounted. Harmless.
+- Capacities are decimal (1 TB = 10¹² bytes), like the drive labels and like Drobo. `df` uses TiB
+  and will always look smaller.
+
+## Status and prior art
+
+Developed and tested on one machine — Ubuntu 26.04, 4 mixed USB drives (1.8/1.8/2.3/0.9 TB) serving
+Samba and Time Machine. Drive-loss, auto-rebuild, re-add, scrub and the capacity-refusal paths are
+exercised on real hardware and on loop devices; see [docs/testing.md](docs/testing.md) to reproduce
+any of it before trusting it with data. Treat it as what it is: a small tool doing a sharp thing to
+your disks. Have backups.
+
+Related projects worth knowing about:
+
+- [danneu/braid](https://github.com/danneu/braid) — a NixOS module and Rust CLI for *encrypted*
+  btrfs RAID1 NAS, with LUKS, USB-keyfile unlock and UPS integration. Similar territory; it
+  rebuilds onto a replacement drive you provide, rather than re-laying-out onto the survivors.
+- [snapraid](https://www.snapraid.it/) + [mergerfs](https://github.com/trapexit/mergerfs) — parity
+  snapshots over independent filesystems. Excellent for archives; a poor fit for data that changes
+  between syncs, and recovery is manual.
+- ZFS — stronger in almost every way except the one that matters here: a vdev is sized by its
+  smallest member, so mixed-size drives waste space.
+
+See [docs/design.md](docs/design.md) for why btrfs RAID1 and not those, and
+[docs/operations.md](docs/operations.md) for the day-to-day runbook.
+
+## License
+
+MIT

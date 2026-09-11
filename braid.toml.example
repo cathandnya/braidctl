@@ -1,33 +1,38 @@
-# /etc/braid/braid.toml — braidctl の設定。無いキーは既定値 (braidctl.py DEFAULT_CONFIG)
+# /etc/braid/braid.toml — braidctl configuration.
+# Anything omitted falls back to DEFAULT_CONFIG in braidctl.py.
 
 mountpoint = "/srv/pool"
 label = "braid"
 
-# 脱落を検知してから自動再冗長化を始めるまでの猶予 (秒)。USB の瞬断で走らせないため
+# Grace period, in seconds, between noticing a drive is gone and re-laying-out without it.
+# Exists so a USB bus glitch that clears in seconds does not trigger a rebuild.
 debounce_sec = 600
 
-# 「外した後の使える容量 × margin >= 使用量」なら再冗長化可能と判定
+# A rebuild is considered possible when  used <= usable_after_loss * rebuild_margin
 rebuild_margin = 0.95
 warn_percent = 90
 
-# 縮退再マウントの間だけ止めるサービス
+# Services stopped only for the degraded-remount fallback during a rebuild
 samba_units = ["smbd"]
 
-# 通知のリマインド間隔 (秒)
+# How often a standing problem is re-reported, in seconds
 remind_interval_sec = 86400
 
-# USB-SATA ブリッジ配下は -d sat が要る (smartd.conf と同じ)
+# Most USB-SATA bridges need an explicit device type for SMART to work
 smart_args = ["-d", "sat"]
 
-# 生きているがエラーが増え続けるドライブを自動で外すか (既定: 通知のみ)
+# Evict drives that are failing but still present, rather than only reporting them.
+# Off by default: a drive throwing occasional errors usually still serves readable copies.
 auto_evict_on_errors = false
 error_threshold = 10
 
-# add で絶対に触らないデバイス (/dev/disk/by-id の名前の部分文字列)
-protected_devices = ["SanDisk_Cruzer_Fit", "APPLE_SSD", "APPLE_SD_Card_Reader"]
+# Substrings of /dev/disk/by-id names that `add` must always refuse, even with --force.
+# Put anything here that must never be absorbed into the pool by a mistyped device node.
+protected_devices = []
 
 [notify]
-# nas-monitor と同じ Gmail SMTP 設定を流用
+# Any JSON file with a notification.email object of
+#   {smtp_server, smtp_port, username, password, from, to, use_tls}
 config_file = "/etc/nas-monitor/config.json"
-to = ""              # 空なら config_file の宛先
+to = ""                     # empty: use the address from config_file
 subject_prefix = "[braid]"

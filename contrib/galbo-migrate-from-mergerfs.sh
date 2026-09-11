@@ -1,11 +1,12 @@
 #!/bin/bash
-# mergerfs プール (/mnt/braid/0N + /srv/pool) を解体し、同じ 4 台で btrfs raid1 を
-# /srv/pool に作り直す。プール上のデータは全て消える（承認済み）。
+# ONE-OFF MIGRATION SCRIPT — NOT A GENERAL TOOL. DO NOT RUN THIS ON YOUR MACHINE.
 #
-#   sudo ~/rc/braid/rebuild-pool.sh
+# Kept as a record of how the development machine was converted from a mergerfs union of four
+# independently-formatted ext4 drives into a single btrfs raid1 pool. It hardcodes that machine's
+# filesystem labels (braid-01..04), mount points, Samba unit names and directory ownership, and it
+# runs `wipefs -a` on every drive it finds. Read it, take the shape of it, write your own.
 #
-# 触るのは braid-0N ラベルの 4 台のみ。ルート SSD (sda) と secure_nas (sdc) には
-# 一切触れない。デバイス名ではなくラベルから解決するので sdX のずれに影響されない。
+# Creating a pool from scratch is three commands; see the README.
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "sudo で実行してください" >&2; exit 1; }

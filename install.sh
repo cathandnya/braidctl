@@ -1,8 +1,12 @@
 #!/bin/bash
-# braidctl と systemd ユニットを配置して timer を有効にする。
-#   sudo ~/rc/braid/install.sh
+# Install braidctl and its systemd timers.
+#
+#   sudo ./install.sh
+#
+# Does not create or modify a pool — see the README for that. An existing
+# /etc/braid/braid.toml is left alone.
 set -euo pipefail
-[ "$(id -u)" -eq 0 ] || { echo "sudo で実行してください" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 install -m 755 "$SRC/braidctl.py" /usr/local/sbin/braidctl

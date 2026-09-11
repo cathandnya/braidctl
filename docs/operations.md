@@ -103,6 +103,16 @@ sudo braidctl mount-degraded      # degraded only
 The pool is deliberately absent from `/etc/fstab`; see [design.md](design.md) for why. This also
 means `mount /srv/pool` will not work — use `braidctl mount`.
 
+## The pool went away entirely
+
+If enough drives disappear that btrfs cannot place a write — the whole enclosure lost power, the
+USB bus reset — `braidctl guard` unmounts the pool on purpose, and you will have an email saying
+so. That is deliberate: a mount with no working devices accepts writes and discards them without
+an error, so removing the mount is the only way the failure becomes visible.
+
+Nothing to do. When the drives come back, udev triggers a monitor pass and the pool is remounted
+within about a second. `journalctl -u braid-guard -u braid-monitor` shows both halves.
+
 ## Scrubbing
 
 A scrub reads every block and verifies it against its checksum, repairing from the good copy when

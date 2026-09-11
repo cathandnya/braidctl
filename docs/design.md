@@ -190,10 +190,38 @@ Hence `99-braid.rules`: when a block device carrying the pool's label appears, u
 Several members reappear at once and each pulls the unit in, so `monitor --if-idle` exits
 quietly when another pass already holds the lock.
 
-**Residual risk, stated plainly:** a write issued between the devices vanishing and the remount
-completing can still be lost without an error. The window is now the length of the outage plus
-about half a second, rather than up to five minutes, but it is not zero. If the bus on your
-machine re-enumerates often, fix that first — it is not something the filesystem can paper over.
+### Closing the window: unmount what cannot be written
+
+Detecting the return quickly still leaves the outage itself, during which the filesystem happily
+accepts writes it is going to throw away. The honest response is to stop pretending: if the pool
+cannot place a write, the mount should not be there.
+
+`braidctl guard` does that. When a member device is removed, udev runs it; it counts live devices
+and compares against what the profile needs to write — two for `raid1`, three for `raid1c3` — and
+if the pool is below that it lazily unmounts. The next `open` then fails, so Samba or Time Machine
+reports an error and retries, which is the correct outcome and the opposite of losing data quietly.
+
+The threshold is the whole design. **Losing one drive out of a healthy `raid1` must do nothing** —
+surviving that is the entire point of the pool, and unmounting there would reintroduce the fstab
+bug this document opens with. Verified both ways:
+
+```
+delete 1 of 4   guard: 3/4 devices present, a 2-copy pool can still write
+                → pool stays mounted, writes succeed
+delete 4 of 4   guard: only 0 of 4 devices present; this pool needs 2 to write
+                → lazy unmount; the next write fails loudly instead of vanishing
+                → devices return, monitor remounts, PROTECTED
+```
+
+A `remove` event cannot start a unit through `SYSTEMD_WANTS` — systemd only does that for
+`add`/`change` — so the rule launches it with `systemd-run --no-block`, which keeps the work off
+the udev worker.
+
+**Residual risk, stated plainly:** a process that already holds the file open keeps writing into
+the detached filesystem; only new opens fail. And a write issued in the moments between the
+devices vanishing and the guard unmounting can still be lost. The window is now small and bounded
+rather than open-ended, but it is not zero. If the bus on your machine re-enumerates often, fix
+that first — it is not something the filesystem can paper over.
 
 ## Why the mount point is immutable
 

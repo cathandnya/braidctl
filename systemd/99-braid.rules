@@ -10,3 +10,15 @@
 # install.sh rewrites the label below to match /etc/braid/braid.toml.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="btrfs", ENV{ID_FS_LABEL}=="braid", \
     TAG+="systemd", ENV{SYSTEMD_WANTS}+="braid-monitor-udev.service"
+
+# A member went away. If too few are left for btrfs to place a write, detach the mount so
+# writes fail visibly instead of being accepted into page cache and thrown away. `guard`
+# decides; losing one drive out of a healthy raid1 deliberately does nothing, because
+# surviving that is the whole point of the pool.
+#
+# Removal events carry the properties udev recorded when the device was added, so
+# ID_FS_LABEL still matches here. SYSTEMD_WANTS does NOT work on a remove event — systemd
+# only starts units from add/change — so the unit is launched with systemd-run instead.
+# --no-block returns immediately, which keeps the work off the udev worker.
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="btrfs", ENV{ID_FS_LABEL}=="braid", \
+    RUN+="/usr/bin/systemd-run --no-block --collect --unit=braid-guard -p Nice=-5 -p TimeoutStartSec=60 /usr/local/sbin/braidctl guard"

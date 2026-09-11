@@ -7,6 +7,7 @@ braidctl — Drobo BeyondRAID-style pool management on top of btrfs raid1.
   remove ID|DEV        remove a drive safely (only if what remains can still hold the data)
   monitor              run from a timer: detect losses and failures, re-protect automatically
   scrub                verify every block against its checksum (monthly timer)
+  guard                unmount if too few devices remain to write (run from udev)
   mount [--wait N]     mount the pool, degraded if need be (run at boot)
   mount-degraded       mount with a drive missing, by hand
 
@@ -508,6 +509,17 @@ def collect(pool):
     return Report(devs=devs, usage=pool.usage(),
                   mounted_degraded="degraded" in m["options"],
                   balance_running=pool.balance_running())
+
+
+def copies_required(profiles):
+    """How many devices a write needs: raid1 places two copies on two distinct devices,
+    raid1c3 three, raid1c4 four. Below this the filesystem cannot allocate a new chunk."""
+    need = 2
+    for p in profiles.values():
+        m = re.match(r"RAID1C(\d)", p)
+        if m:
+            need = max(need, int(m[1]))
+    return need
 
 
 def can_rebuild(report, cfg, losing=None):
@@ -1132,6 +1144,61 @@ def cmd_scrub(cfg, args):
         sys.exit(1)
 
 
+def cmd_guard(cfg, args):
+    """Unmount a pool that can no longer write, so writes fail loudly instead of vanishing.
+
+    When enough devices disappear that btrfs cannot place a full set of copies, the mount
+    becomes a zombie: writes land in page cache, `write`, `fsync` and `sync` all return
+    success, and the data is discarded at the next remount with every error counter still
+    at zero. Measured, not theorised — 128 MB written that way was simply gone.
+
+    A lazy unmount makes the path stop resolving immediately, so the next open fails and
+    whatever is writing (Samba, Time Machine) reports an error and retries, which is the
+    correct outcome. The monitor remounts as soon as the devices return.
+
+    The threshold matters enormously in the other direction: losing ONE drive out of a
+    healthy raid1 must NOT unmount anything — surviving that is the entire point of the
+    pool. So this only fires below `copies_required`."""
+    require_root()
+    pool = Pool(cfg)
+    if not pool.is_mounted():
+        LOG.info("guard: not mounted, nothing to do")
+        return
+    devs = pool.devices()
+    live = [d for d in devs if d.present]
+    need = copies_required(pool.usage().profiles)
+    if len(live) >= need:
+        LOG.info("guard: %d/%d devices present, a %d-copy pool can still write",
+                 len(live), len(devs), need)
+        return
+
+    LOG.error("guard: only %d of %d devices present; this pool needs %d to write. "
+              "Unmounting so writes fail instead of being silently discarded.",
+              len(live), len(devs), need)
+    p = run(["umount", "-l", cfg["mountpoint"]], check=False)
+    ok = p.returncode == 0
+    if not ok:
+        LOG.error("guard: lazy unmount failed: %s", (p.stderr or p.stdout or "").strip())
+    notifier = Notifier(cfg)
+    state = State(cfg["state_file"]).load()
+    notifier.send("Pool unmounted: too few devices to write" if ok
+                  else "Pool cannot write and could not be unmounted",
+                  f"Only {len(live)} of {len(devs)} devices are present and this pool needs "
+                  f"{need} to place a write.\n"
+                  + ("The mount has been detached so writes fail visibly rather than being "
+                     "accepted and thrown away. It will be remounted automatically as soon as "
+                     "the devices return.\n"
+                     if ok else
+                     "The lazy unmount failed, so writes may still be silently discarded.\n")
+                  + "\nNote that anything holding a file open across this keeps writing into the "
+                    "detached filesystem; only new opens fail.")
+    try:
+        write_snapshot(cfg, pool, None, state,
+                       note=f"unmounted by guard: {len(live)}/{len(devs)} devices present")
+    except Exception:  # a snapshot is a nicety; never let it mask the unmount
+        pass
+
+
 def cmd_mount(cfg, args):
     """Mount the pool at boot. This exists because the pool must NOT be in /etc/fstab:
     systemd ties an fstab mount to one backing device and unmounts the filesystem when
@@ -1201,6 +1268,9 @@ def main(argv=None):
     s = sub.add_parser("scrub", help="verify every block against its checksum")
     s.add_argument("--quiet", action="store_true", help="do not notify on success")
     s.set_defaults(fn=cmd_scrub)
+
+    s = sub.add_parser("guard", help="unmount if too few devices remain to write (for udev)")
+    s.set_defaults(fn=cmd_guard)
 
     s = sub.add_parser("mount", help="mount the pool, degraded if need be (run at boot)")
     s.add_argument("--wait", type=int, default=0,

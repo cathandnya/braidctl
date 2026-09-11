@@ -160,10 +160,13 @@ Destroying an array by mistyping a device node is a real risk for a tool like th
   a NAS's data to a full `/`.
 - **One mutation at a time.** `monitor` holds a lock; `add`/`remove` refuse while a balance runs.
 - **Rebuilds are debounced.** A USB bus glitch that clears in seconds must not trigger a re-layout.
-- **A udev rule watches for members reappearing.** After a bus re-enumeration every drive comes
-  back under a new device node, which leaves the mount pointing at dead ones and silently
-  discarding writes until it is remounted — see [docs/design.md](docs/design.md). The rule
-  shortens that window from the timer's five minutes to under a second.
+- **A udev rule watches members appearing and disappearing.** After a bus re-enumeration every
+  drive comes back under a new device node, which leaves the mount pointing at dead ones and
+  silently discarding writes until it is remounted; the rule shortens that from the timer's five
+  minutes to under a second. And if so many devices vanish that the pool can no longer place a
+  write, `braidctl guard` unmounts it, so writes fail loudly rather than being accepted and
+  thrown away. Losing a single drive from a healthy `raid1` deliberately does nothing — see
+  [docs/design.md](docs/design.md).
 
 ## Limitations
 

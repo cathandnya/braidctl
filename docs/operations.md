@@ -124,7 +124,7 @@ knowing:
 
 | Key | Default | Notes |
 |---|---|---|
-| `mountpoint`, `label` | `/srv/pool`, `braid` | Must match `fstab` |
+| `mountpoint`, `label` | `/srv/pool`, `braid` | Must match the filesystem label and `braid-mount.service` |
 | `debounce_sec` | `600` | Grace period before a rebuild. Raise it for flaky USB |
 | `rebuild_margin` | `0.95` | Fraction of post-loss usable capacity allowed to be occupied |
 | `warn_percent` | `90` | Capacity warning threshold |

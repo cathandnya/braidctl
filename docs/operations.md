@@ -88,16 +88,20 @@ saying so. To reuse it: `sudo braidctl add --force /dev/sdX`.
 
 ## Boot with a drive missing
 
-`fstab` mounting fails harmlessly (`nofail`), the pool does not mount, and three minutes into the
-boot the monitor mounts it `-o degraded` and emails you. Services that depend on the mount should be
-ordered after it in systemd so they don't start against an empty directory — and the immutable mount
-point means that even if they do, they fail loudly instead of writing to the root filesystem.
+`braid-mount.service` runs `braidctl mount --wait 120` at boot: it retries quietly while USB
+enumeration settles, then falls back to a degraded mount and emails you. It is ordered before
+`smbd`, so file sharing does not start against an unmounted pool — and the immutable mount point
+means that even if something does, it fails loudly instead of writing to the root filesystem.
 
 To do it by hand:
 
 ```bash
-sudo braidctl mount-degraded
+sudo braidctl mount               # normal, falling back to degraded
+sudo braidctl mount-degraded      # degraded only
 ```
+
+The pool is deliberately absent from `/etc/fstab`; see [design.md](design.md) for why. This also
+means `mount /srv/pool` will not work — use `braidctl mount`.
 
 ## Scrubbing
 

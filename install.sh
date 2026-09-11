@@ -13,10 +13,11 @@ install -m 755 "$SRC/braidctl.py" /usr/local/sbin/braidctl
 mkdir -p /etc/braid /var/lib/braid
 [ -e /etc/braid/braid.toml ] || install -m 644 "$SRC/braid.toml.example" /etc/braid/braid.toml
 
-for u in braid-monitor.service braid-monitor.timer braid-scrub.service braid-scrub.timer; do
+for u in braid-mount.service braid-monitor.service braid-monitor.timer braid-scrub.service braid-scrub.timer; do
     install -m 644 "$SRC/systemd/$u" "/etc/systemd/system/$u"
 done
 systemctl daemon-reload
+systemctl enable braid-mount.service
 systemctl enable --now braid-monitor.timer braid-scrub.timer
 
 echo "installed: /usr/local/sbin/braidctl, /etc/braid/braid.toml"

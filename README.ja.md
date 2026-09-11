@@ -102,11 +102,17 @@ sudo braidctl/install.sh        # /usr/local/sbin/braidctl, /etc/braid/braid.tom
 
 ```bash
 sudo mkfs.btrfs -L braid -d raid1 -m raid1 /dev/sdX /dev/sdY /dev/sdZ
-echo 'LABEL=braid /srv/pool btrfs noatime,nofail,x-systemd.device-timeout=120 0 0' | sudo tee -a /etc/fstab
 sudo mkdir -p /srv/pool && sudo chattr +i /srv/pool   # 後述の「安全装置」
-sudo systemctl daemon-reload && sudo mount /srv/pool
+sudo systemctl start braid-mount.service              # マウント。起動時は install.sh が有効化済み
 sudo braidctl status
 ```
+
+**プールを `/etc/fstab` に書いてはいけない。** systemd は fstab のマウントを
+**特定の 1 台**に紐付け、そのデバイスが消えた瞬間にファイルシステムをアンマウントする。
+冗長なマルチデバイスプールにとって、これはドライブを失ったときの対応として完全に逆であり、
+無害な USB バスの再列挙でも発動する。代わりに `braid-mount.service` がマウントすることで、
+マウントユニットにデバイス依存が一切付かなくなる。根拠と実測は
+[docs/design.md](docs/design.md)。
 
 ファイルシステムのラベル、設定ディレクトリ、systemd ユニットはすべて `braid` — プールの名前。
 `braidctl` はそれを管理するコマンド。マウントポイント・ラベル・再構築中に止めるサービスが
@@ -123,6 +129,7 @@ sudo braidctl remove /dev/sdg     # パス指定でも可
 sudo braidctl remove missing      # 死んだドライブを手で外す (monitor が自動でやるのと同じ)
 sudo braidctl monitor             # 検知を 1 回。timer から 5 分毎に呼ばれる
 sudo braidctl scrub               # 全ブロックをチェックサムと照合
+sudo braidctl mount               # プールをマウント (--wait N でドライブ出現を待つ)
 sudo braidctl mount-degraded      # 1 台欠けた状態で手動マウント
 ```
 

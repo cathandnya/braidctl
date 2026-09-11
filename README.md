@@ -104,11 +104,17 @@ Then create a pool, if you don't have one — **this erases the drives**:
 
 ```bash
 sudo mkfs.btrfs -L braid -d raid1 -m raid1 /dev/sdX /dev/sdY /dev/sdZ
-echo 'LABEL=braid /srv/pool btrfs noatime,nofail,x-systemd.device-timeout=120 0 0' | sudo tee -a /etc/fstab
 sudo mkdir -p /srv/pool && sudo chattr +i /srv/pool   # see "Safety" below
-sudo systemctl daemon-reload && sudo mount /srv/pool
+sudo systemctl start braid-mount.service              # mounts it; enabled at boot by install.sh
 sudo braidctl status
 ```
+
+**Do not add the pool to `/etc/fstab`.** systemd binds an fstab mount to a single backing
+device and unmounts the filesystem the moment that device disappears — for a redundant
+multi-device pool that is exactly the wrong response to losing a drive, and a harmless USB
+bus re-enumeration triggers it too. `braid-mount.service` mounts the pool instead, which
+leaves the mount with no device binding at all. The reasoning and the measurements are in
+[docs/design.md](docs/design.md).
 
 The pool's filesystem label, the config directory and the systemd units are all named `braid` — the
 pool. `braidctl` is the command that manages it. Edit `/etc/braid/braid.toml` if your mount point,
@@ -125,6 +131,7 @@ sudo braidctl remove /dev/sdg     # by path
 sudo braidctl remove missing      # evict a dead drive by hand (what monitor does for you)
 sudo braidctl monitor             # one detection pass; run from the timer every 5 minutes
 sudo braidctl scrub               # verify every block against its checksum
+sudo braidctl mount               # mount the pool (--wait N to retry while drives appear)
 sudo braidctl mount-degraded      # mount with a drive missing, by hand
 ```
 

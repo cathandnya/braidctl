@@ -114,6 +114,49 @@ departing device into unallocated space elsewhere, and a pool whose chunks are h
 plenty of *free* space while having almost no *unallocated* space. Compacting first is the
 difference between a rebuild that works and an `ENOSPC` at 80% full.
 
+## Why the pool is not in /etc/fstab
+
+Put a multi-device btrfs in `/etc/fstab` and systemd will unmount it when *one* member
+disappears. That is not a theory; it is what happened here, and it makes the redundancy
+pointless — the array survives, and the mount does not.
+
+`systemd-fstab-generator` resolves `LABEL=braid` to a single device node and gives the mount
+unit an implicit `Requires=` **plus `StopPropagatedFrom=`** on it. `StopPropagatedFrom=` is
+the part that hurts: when that one device unit goes away, the stop propagates to the mount.
+For a 4-drive pool the label resolves to whichever member udev linked last, so the mount ends
+up hostage to an arbitrary one of them:
+
+```
+20:28:19.256  kernel:  usb 2-2: USB disconnect              (hub reset — every pool drive went away)
+20:28:19.327  systemd: Unmounting srv-pool.mount...          (dev-sdd.device vanished)
+20:28:19.346  kernel:  BTRFS info: last unmount of filesystem
+20:28:20.523  kernel:  usb 1-2: new high-speed USB device    (all of them came straight back)
+```
+
+The drives were gone for under a second. The pool stayed down until something remounted it.
+
+`x-systemd.device-timeout=` does not help — it is a start-time timeout. **`x-systemd.device-bound=false`
+does not help either**, which is worth knowing because the documentation reads as though it
+should: it works while the unit is loaded from the fragment alone, but once the filesystem is
+actually mounted systemd re-derives the device dependencies from `/proc/self/mountinfo`, where
+no `x-systemd.*` option survives, and `StopPropagatedFrom=` comes back. Measured, not assumed:
+
+```
+(fstab entry, unit inactive)   StopPropagatedFrom=            ← option honoured
+(fstab entry, unit active)     StopPropagatedFrom=dev-sdd.device
+                               → deleting sdd unmounts the pool
+(no fstab entry)               StopPropagatedFrom=
+                               → deleting sdd leaves the pool mounted and writable
+```
+
+The last case is what `braid-mount.service` buys: a mount with no fragment gets only
+`Requires=`, and `Requires=` alone does not propagate a stop. Losing a drive then does what it
+should — nothing, until the monitor decides whether to re-protect.
+
+The cost is that `mount /srv/pool` no longer works from memory; it is
+`braidctl mount`, which is also what the service runs, with `--wait` so a boot can outlast
+USB enumeration.
+
 ## Why the mount point is immutable
 
 The failure that actually destroys NAS installations is not a disk dying. It is the pool failing to

@@ -7,6 +7,7 @@ braidctl — Drobo BeyondRAID-style pool management on top of btrfs raid1.
   remove ID|DEV        remove a drive safely (only if what remains can still hold the data)
   monitor              run from a timer: detect losses and failures, re-protect automatically
   scrub                verify every block against its checksum (monthly timer)
+  mount [--wait N]     mount the pool, degraded if need be (run at boot)
   mount-degraded       mount with a drive missing, by hand
 
 btrfs itself provides chunk-level mirroring, mixed drive sizes, and online add/remove.
@@ -276,8 +277,15 @@ class Pool:
         return bool(m and m["fstype"] == "btrfs")
 
     def uuid(self):
-        p = run(["findmnt", "-no", "UUID", self.mnt], check=False)
-        return (p.stdout or "").strip()
+        """The filesystem's fsid. Ask btrfs, not findmnt: findmnt derives the UUID from
+        the mount's source device node, and that is empty precisely when the device that
+        vanished happens to be the one the mount was made through — the case where the
+        fsid is needed most (matching a returned member, reading the sysfs missing flag)."""
+        p = run(["btrfs", "filesystem", "show", self.mnt], check=False)
+        m = re.search(r"uuid:\s*([0-9a-fA-F-]{36})", p.stdout)
+        if m:
+            return m[1]
+        return (run(["findmnt", "-no", "UUID", self.mnt], check=False).stdout or "").strip()
 
     def member_devices_present(self):
         """Devices visible as members of this pool, mounted or not"""
@@ -1105,6 +1113,29 @@ def cmd_scrub(cfg, args):
         sys.exit(1)
 
 
+def cmd_mount(cfg, args):
+    """Mount the pool at boot. This exists because the pool must NOT be in /etc/fstab:
+    systemd ties an fstab mount to one backing device and unmounts the filesystem when
+    that device disappears — which for a redundant multi-device pool is precisely the
+    wrong response to losing a drive. See docs/design.md."""
+    require_root()
+    pool = Pool(cfg)
+    # Quiet retry loop: right after boot the USB bus is still enumerating, and
+    # "not yet" is not a failure worth an email.
+    deadline = time.time() + max(0, args.wait)
+    while not pool.is_mounted() and time.time() < deadline:
+        if pool.member_devices_present() and pool.mount(check=False).returncode == 0:
+            break
+        time.sleep(5)
+    notifier = Notifier(cfg)
+    state = State(cfg["state_file"]).load()
+    if not ensure_mounted(cfg, pool, notifier, state):   # degraded fallback, and notify
+        state.save()
+        raise BraidError(f"could not mount {cfg['mountpoint']}")
+    state.save()
+    print(render_status(collect(pool), cfg, state))
+
+
 def cmd_mount_degraded(cfg, args):
     require_root()
     pool = Pool(cfg)
@@ -1149,6 +1180,11 @@ def main(argv=None):
     s = sub.add_parser("scrub", help="verify every block against its checksum")
     s.add_argument("--quiet", action="store_true", help="do not notify on success")
     s.set_defaults(fn=cmd_scrub)
+
+    s = sub.add_parser("mount", help="mount the pool, degraded if need be (run at boot)")
+    s.add_argument("--wait", type=int, default=0,
+                   help="seconds to keep retrying while the drives appear (boot)")
+    s.set_defaults(fn=cmd_mount)
 
     s = sub.add_parser("mount-degraded", help="mount with a drive missing")
     s.set_defaults(fn=cmd_mount_degraded)

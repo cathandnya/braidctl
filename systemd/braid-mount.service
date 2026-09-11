@@ -1,0 +1,21 @@
+[Unit]
+Description=Mount the braid pool (btrfs raid1)
+Documentation=https://github.com/cathandnya/braidctl
+# The pool is deliberately NOT in /etc/fstab. systemd ties an fstab mount to one
+# backing device and unmounts the filesystem the moment that device disappears —
+# for a redundant multi-device pool that is exactly the wrong response to losing a
+# drive, and it fires on a harmless USB bus re-enumeration too. Mounting it from
+# here leaves the mount unit with no device binding at all.
+After=local-fs.target
+# Serve the pool only once it is actually mounted.
+Before=smbd.service nmbd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# USB enumeration is still settling at this point; --wait retries quietly.
+ExecStart=/usr/local/sbin/braidctl mount --wait 120
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

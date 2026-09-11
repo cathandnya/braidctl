@@ -157,6 +157,44 @@ The cost is that `mount /srv/pool` no longer works from memory; it is
 `braidctl mount`, which is also what the service runs, with `--wait` so a boot can outlast
 USB enumeration.
 
+## The other half: a bus re-enumeration is not a drive failure
+
+Keeping the mount alive when a device disappears fixes the common case — one drive dying,
+three still working — but it exposes a nastier one. When a USB bus re-enumerates, every drive
+comes back under a *new* device node, and btrfs will not swap new nodes into an already-mounted
+filesystem. The kernel just logs:
+
+```
+BTRFS warning: duplicate device /dev/sdd devid 1 generation 224 scanned by (udev-worker)
+```
+
+The mount survives, pointing at block devices that no longer exist. All members read as
+MISSING. And writes to it **appear to succeed** — measured here with `dd` + `sync` + `md5sum`,
+all of which returned cleanly for 128 MB that did not exist after the filesystem was
+remounted. Nothing in the pool reports an error; the error counters stay at zero.
+
+Silent loss is worse than the loud failure it replaced, so the window has to be small. Only a
+remount repairs the state, which the monitor already does when it sees members return under new
+nodes — but the timer runs every five minutes, and five minutes of a filesystem quietly
+discarding writes is not acceptable.
+
+Hence `99-braid.rules`: when a block device carrying the pool's label appears, udev starts
+`braid-monitor-udev.service` immediately. Measured on the same failure:
+
+```
+20:53:54.189  first device re-attached
+20:53:54.343  braid-monitor-udev.service starts     (+154 ms)
+20:53:54.553  remount begins                        (+364 ms)
+```
+
+Several members reappear at once and each pulls the unit in, so `monitor --if-idle` exits
+quietly when another pass already holds the lock.
+
+**Residual risk, stated plainly:** a write issued between the devices vanishing and the remount
+completing can still be lost without an error. The window is now the length of the outage plus
+about half a second, rather than up to five minutes, but it is not zero. If the bus on your
+machine re-enumerates often, fix that first — it is not something the filesystem can paper over.
+
 ## Why the mount point is immutable
 
 The failure that actually destroys NAS installations is not a disk dying. It is the pool failing to

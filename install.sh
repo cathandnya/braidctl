@@ -13,12 +13,25 @@ install -m 755 "$SRC/braidctl.py" /usr/local/sbin/braidctl
 mkdir -p /etc/braid /var/lib/braid
 [ -e /etc/braid/braid.toml ] || install -m 644 "$SRC/braid.toml.example" /etc/braid/braid.toml
 
-for u in braid-mount.service braid-monitor.service braid-monitor.timer braid-scrub.service braid-scrub.timer; do
+for u in braid-mount.service braid-monitor.service braid-monitor.timer \
+         braid-monitor-udev.service braid-scrub.service braid-scrub.timer; do
     install -m 644 "$SRC/systemd/$u" "/etc/systemd/system/$u"
 done
+
+# The udev rule has to name the pool's filesystem label literally, so stamp in whatever
+# the config says rather than assuming the default.
+LABEL=$(sed -n 's/^[[:space:]]*label[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /etc/braid/braid.toml | head -1)
+LABEL=${LABEL:-braid}
+sed "s/ENV{ID_FS_LABEL}==\"braid\"/ENV{ID_FS_LABEL}==\"$LABEL\"/" \
+    "$SRC/systemd/99-braid.rules" > /etc/udev/rules.d/99-braid.rules
+chmod 644 /etc/udev/rules.d/99-braid.rules
+udevadm control --reload-rules
+
 systemctl daemon-reload
 systemctl enable braid-mount.service
 systemctl enable --now braid-monitor.timer braid-scrub.timer
+
+echo "udev rule installed for LABEL=$LABEL"
 
 echo "installed: /usr/local/sbin/braidctl, /etc/braid/braid.toml"
 systemctl list-timers 'braid-*' --no-pager

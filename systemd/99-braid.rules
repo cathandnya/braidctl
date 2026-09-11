@@ -1,0 +1,12 @@
+# A member of the braid pool appeared. Run a monitor pass now instead of waiting up to
+# five minutes for the timer.
+#
+# This matters most after a USB bus re-enumeration, when every drive comes back under a new
+# device node. btrfs will not swap new nodes into an already-mounted filesystem, so the mount
+# is left pointing at dead block devices: writes land in page cache, report success, and are
+# lost when the filesystem is finally remounted. Only a remount repairs it, and nothing else
+# notices — so the window has to be as short as possible.
+#
+# install.sh rewrites the label below to match /etc/braid/braid.toml.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="btrfs", ENV{ID_FS_LABEL}=="braid", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="braid-monitor-udev.service"

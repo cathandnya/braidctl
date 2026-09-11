@@ -154,13 +154,20 @@ class State:
                      "rebuild": None, "smart_base": {}}
         self._lock_fh = None
 
-    def lock(self):
+    def lock(self, quiet=False):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fh = open(self.path.with_suffix(".lock"), "w")
         try:
             fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if quiet:
+                # A udev-triggered pass while another is already working is not a
+                # problem: the work is being done. Several fire at once when a bus
+                # re-enumerates and every member device reappears.
+                LOG.info("another braidctl holds the lock; nothing to do")
+                return False
             raise BraidError("another braidctl is already running (monitor/rebuild)")
+        return True
 
     def load(self):
         if self.path.exists():
@@ -967,7 +974,8 @@ def cmd_monitor(cfg, args):
     pool = Pool(cfg)
     notifier = Notifier(cfg)
     state = State(cfg["state_file"])
-    state.lock()
+    if not state.lock(quiet=args.if_idle):
+        return
     state.load()
     now = time.time()
     debounce = args.debounce if args.debounce is not None else cfg["debounce_sec"]
@@ -981,7 +989,18 @@ def cmd_monitor(cfg, args):
     missing = state.data["missing"]
 
     # --- a member that was only temporarily absent came back: re-attach, do not rebuild ---
+    #
+    # This is also what rescues the pool after a USB bus re-enumeration, where every drive
+    # comes back under a NEW device node. btrfs will not swap new nodes into a mounted
+    # filesystem — the kernel just logs "duplicate device ... scanned by udev-worker" — so
+    # the mount is left holding dead block devices. Writes to it then land in page cache and
+    # are lost, while reporting success. Only a remount fixes it, and until it happens the
+    # damage is silent, which is why a udev rule triggers this pass within a second or two
+    # rather than waiting for the timer.
     returned, stale = pool.returned_members(report)
+    if returned and len(returned) == len(report.devs):
+        LOG.warning("every member returned under a new device node; the mount is stale "
+                    "and writes to it are being lost. Remounting now.")
     if returned and not report.balance_running and state.data.get("rebuild") is None:
         if reattach(cfg, pool, notifier, state, returned):
             report = collect(pool)
@@ -1175,6 +1194,8 @@ def main(argv=None):
     s = sub.add_parser("monitor", help="detect losses and re-protect automatically (for the timer)")
     s.add_argument("--debounce", type=int, default=None,
                    help="seconds; overrides the configured value (for testing)")
+    s.add_argument("--if-idle", action="store_true",
+                   help="exit quietly if another braidctl holds the lock (for udev)")
     s.set_defaults(fn=cmd_monitor)
 
     s = sub.add_parser("scrub", help="verify every block against its checksum")

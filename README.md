@@ -160,6 +160,10 @@ Destroying an array by mistyping a device node is a real risk for a tool like th
   a NAS's data to a full `/`.
 - **One mutation at a time.** `monitor` holds a lock; `add`/`remove` refuse while a balance runs.
 - **Rebuilds are debounced.** A USB bus glitch that clears in seconds must not trigger a re-layout.
+- **A udev rule watches for members reappearing.** After a bus re-enumeration every drive comes
+  back under a new device node, which leaves the mount pointing at dead ones and silently
+  discarding writes until it is remounted — see [docs/design.md](docs/design.md). The rule
+  shortens that window from the timer's five minutes to under a second.
 
 ## Limitations
 

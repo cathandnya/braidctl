@@ -1,0 +1,11 @@
+[Unit]
+Description=braid pool monitor (triggered by a member device appearing)
+Documentation=https://github.com/cathandnya/braidctl
+# Several members reappear at once after a bus re-enumeration and each one pulls this in;
+# --if-idle makes the redundant passes exit quietly instead of failing on the lock.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/braidctl monitor --if-idle
+TimeoutStartSec=infinity
+Nice=5

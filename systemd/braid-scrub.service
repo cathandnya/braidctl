@@ -1,0 +1,12 @@
+[Unit]
+Description=braid pool scrub (verify all data against checksums)
+After=local-fs.target
+# monitor の再構築中は走らせない
+Conflicts=braid-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/braidctl scrub
+TimeoutStartSec=infinity
+Nice=15
+IOSchedulingClass=idle

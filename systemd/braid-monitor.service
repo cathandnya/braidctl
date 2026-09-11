@@ -1,0 +1,12 @@
+[Unit]
+Description=braid pool monitor (failure detection and auto-rebuild)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/braidctl monitor
+# 再冗長化 (btrfs device remove) は数時間かかることがある
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

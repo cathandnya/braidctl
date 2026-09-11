@@ -1,0 +1,33 @@
+# /etc/braid/braid.toml — braidctl の設定。無いキーは既定値 (braidctl.py DEFAULT_CONFIG)
+
+mountpoint = "/srv/pool"
+label = "braid"
+
+# 脱落を検知してから自動再冗長化を始めるまでの猶予 (秒)。USB の瞬断で走らせないため
+debounce_sec = 600
+
+# 「外した後の使える容量 × margin >= 使用量」なら再冗長化可能と判定
+rebuild_margin = 0.95
+warn_percent = 90
+
+# 縮退再マウントの間だけ止めるサービス
+samba_units = ["smbd"]
+
+# 通知のリマインド間隔 (秒)
+remind_interval_sec = 86400
+
+# USB-SATA ブリッジ配下は -d sat が要る (smartd.conf と同じ)
+smart_args = ["-d", "sat"]
+
+# 生きているがエラーが増え続けるドライブを自動で外すか (既定: 通知のみ)
+auto_evict_on_errors = false
+error_threshold = 10
+
+# add で絶対に触らないデバイス (/dev/disk/by-id の名前の部分文字列)
+protected_devices = ["SanDisk_Cruzer_Fit", "APPLE_SSD", "APPLE_SD_Card_Reader"]
+
+[notify]
+# nas-monitor と同じ Gmail SMTP 設定を流用
+config_file = "/etc/nas-monitor/config.json"
+to = ""              # 空なら config_file の宛先
+subject_prefix = "[braid]"

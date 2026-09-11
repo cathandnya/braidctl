@@ -1,0 +1,12 @@
+[Unit]
+Description=Run braid pool monitor every 5 minutes
+
+[Timer]
+# 起動直後は USB ドライブの認識と fstab マウント (device-timeout=120) を待つ
+OnBootSec=3min
+# 前回の実行が終わってから 5 分後 (再構築中は重ならない)
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

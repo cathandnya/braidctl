@@ -6,7 +6,7 @@ Conflicts=braid-monitor.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/braidctl scrub
+ExecStart=/usr/local/sbin/braidctl scrub --quiet
 TimeoutStartSec=infinity
 Nice=15
 IOSchedulingClass=idle

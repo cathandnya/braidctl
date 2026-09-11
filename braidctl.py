@@ -46,6 +46,9 @@ DEFAULT_CONFIG = {
     # Services stopped only for the degraded-remount fallback
     "samba_units": ["smbd"],
     "state_file": "/var/lib/braid/state.json",
+    # Machine-readable copy of what the last monitor pass saw, world-readable, for
+    # dashboards that cannot run btrfs as root. Empty string disables it.
+    "status_file": "/var/lib/braid/status.json",
     "remind_interval_sec": 86400,
     "smart_args": ["-d", "sat"],
     # Evict drives that are failing but still present, instead of only reporting them
@@ -505,6 +508,55 @@ def can_rebuild(report, cfg, losing=None):
 
 # ---------------------------------------------------------------- status
 
+def device_health(d):
+    """One device's health as (level, text). level: ok / info / warn / fail / missing / unknown.
+    'info' is a defect that is present but not growing (a stable reallocated count)."""
+    if d.missing or not d.present:
+        return "missing", "MISSING"
+    s = d.smart
+    if not s or s.get("passed") is None:
+        return "unknown", "SMART n/a"
+    if s.get("passed") is False:
+        return "fail", "SMART FAIL"
+    level, text = "ok", "OK"
+    bad = [k for k in ("reallocated", "pending", "offline_uncorr") if (s.get(k) or 0) > 0]
+    if bad:
+        level = "warn" if any(k in ("pending", "offline_uncorr") for k in bad) else "info"
+        text = "WARN " + " ".join(f"{k}={s[k]}" for k in bad)
+    if s.get("temp") is not None:
+        text += f" {s['temp']}°C"
+    return level, text
+
+
+def verdict(report, cfg):
+    """The last line of `status` — Drobo's green / amber / red light — as (level, text)."""
+    u = report.usage
+    if report.gone:
+        ok, after, needed = can_rebuild(report, cfg)
+        if ok:
+            return "warn", (f"! {len(report.gone)} drive(s) missing. Can re-protect with what remains "
+                            f"(usable {fmt_bytes(after)} >= used {fmt_bytes(needed)}); the monitor will do it")
+        short = needed / cfg["rebuild_margin"] - after
+        return "fail", (f"!! {len(report.gone)} drive(s) missing. Cannot re-protect with what remains "
+                        f"(usable {fmt_bytes(after)} < used {fmt_bytes(needed)}). "
+                        f"Add at least {fmt_bytes(short)} more")
+    healthy = [d for d in report.devs if d.present]
+    if len(healthy) < 2:
+        return "fail", "Only one drive present; nothing is mirrored"
+    largest = max(healthy, key=lambda d: d.size)
+    after = report.usable_after_losing(largest)
+    if u.used <= after * cfg["rebuild_margin"]:
+        return "ok", (f"Any single drive can be lost and re-protected "
+                      f"(losing the largest, {largest.name} {fmt_bytes(largest.size)}, "
+                      f"leaves {fmt_bytes(after)} usable >= {fmt_bytes(u.used)} used)")
+    tol = [d.name for d in healthy if u.used <= report.usable_after_losing(d) * cfg["rebuild_margin"]]
+    return "warn", (f"Warning: losing {largest.name} ({fmt_bytes(largest.size)}) cannot be re-protected "
+                    f"(would leave {fmt_bytes(after)} usable < {fmt_bytes(u.used)} used). "
+                    + (f"Only losing {', '.join(tol)} can be recovered automatically"
+                       if tol else "No single drive loss can be recovered automatically")
+                    + ". Consider adding a drive")
+
+
 def render_status(report, cfg, state=None):
     u = report.usage
     lines = []
@@ -519,55 +571,18 @@ def render_status(report, cfg, state=None):
     inv = (state.data.get("inventory", {}) if state else {})
     for d in report.devs:
         errs = sum(d.errors.values()) if d.errors else 0
+        _, health = device_health(d)
         if d.missing or not d.present:
             known = inv.get(str(d.devid), {})
-            health = "MISSING"
             model = known.get("model", "?")
             name = f"(was {os.path.basename(known.get('path', '') or d.path or '?')})"
         else:
             model = d.model
             name = d.name
-            s = d.smart
-            if not s or s.get("passed") is None:
-                health = "SMART n/a"
-            elif s.get("passed") is False:
-                health = "SMART FAIL"
-            else:
-                health = "OK"
-                bad = [k for k in ("reallocated", "pending", "offline_uncorr") if (s.get(k) or 0) > 0]
-                if bad:
-                    health = "WARN " + " ".join(f"{k}={s[k]}" for k in bad)
-                if s.get("temp") is not None:
-                    health += f" {s['temp']}°C"
         lines.append(f"{d.devid:>2}  {name:8} {model[:22]:22} {fmt_bytes(d.size):>9} {fmt_bytes(d.used):>9}  "
                      f"{errs:>6}  {health}")
     lines.append("")
-    if report.gone:
-        ok, after, needed = can_rebuild(report, cfg)
-        if ok:
-            lines.append(f"! {len(report.gone)} drive(s) missing. Can re-protect with what remains "
-                         f"(usable {fmt_bytes(after)} >= used {fmt_bytes(needed)}); the monitor will do it")
-        else:
-            short = needed / cfg["rebuild_margin"] - after
-            lines.append(f"!! {len(report.gone)} drive(s) missing. Cannot re-protect with what remains "
-                         f"(usable {fmt_bytes(after)} < used {fmt_bytes(needed)}). "
-                         f"Add at least {fmt_bytes(short)} more")
-    else:
-        healthy = [d for d in report.devs if d.present]
-        if len(healthy) >= 2:
-            largest = max(healthy, key=lambda d: d.size)
-            after = report.usable_after_losing(largest)
-            if u.used <= after * cfg["rebuild_margin"]:
-                lines.append(f"Any single drive can be lost and re-protected "
-                             f"(losing the largest, {largest.name} {fmt_bytes(largest.size)}, "
-                             f"leaves {fmt_bytes(after)} usable >= {fmt_bytes(u.used)} used)")
-            else:
-                tol = [d.name for d in healthy if u.used <= report.usable_after_losing(d) * cfg["rebuild_margin"]]
-                lines.append(f"Warning: losing {largest.name} ({fmt_bytes(largest.size)}) cannot be re-protected "
-                             f"(would leave {fmt_bytes(after)} usable < {fmt_bytes(u.used)} used). "
-                             + (f"Only losing {', '.join(tol)} can be recovered automatically"
-                                if tol else "No single drive loss can be recovered automatically")
-                             + ". Consider adding a drive")
+    lines.append(verdict(report, cfg)[1])
     if pct >= cfg["warn_percent"]:
         lines.append(f"Warning: {pct:.0f}% full. Rebuilds (balance) fail when free space runs short")
     if report.balance_running:
@@ -713,6 +728,87 @@ def cmd_remove(cfg, args):
                          f"`btrfs balance start --full-balance {cfg['mountpoint']}` and retry, or add a drive")
     print("== done")
     print(render_status(collect(pool), cfg))
+
+
+# ---------------------------------------------------------------- snapshot
+
+def scrub_info(pool):
+    """Parse `btrfs scrub status` into a small dict"""
+    out = {}
+    for line in pool.scrub_status().splitlines():
+        m = re.match(r"\s*(Status|Scrub started|Scrub resumed|Duration|Total to scrub|Rate|Error summary):\s+(.*)", line)
+        if m:
+            out[m[1]] = m[2].strip()
+    info = {"status": out.get("Status"), "started": None, "duration": out.get("Duration"),
+            "total": out.get("Total to scrub"), "rate": out.get("Rate"),
+            "error_summary": out.get("Error summary")}
+    if out.get("Scrub started"):
+        try:
+            info["started"] = int(time.mktime(time.strptime(out["Scrub started"], "%a %b %d %H:%M:%S %Y")))
+        except ValueError:
+            pass
+    return info
+
+
+def write_snapshot(cfg, pool, report, state, note=None):
+    """World-readable JSON of what monitor just saw, so a dashboard running without root
+    can show the pool. Everything btrfs reports about devices and usage needs root."""
+    path = cfg.get("status_file")
+    if not path:
+        return
+    snap = {"version": 1, "generated_at": int(time.time()),
+            "mountpoint": cfg["mountpoint"], "label": cfg["label"]}
+    inv = state.data.get("inventory", {})
+    if report is None:
+        snap.update({"state": "UNMOUNTED", "note": note, "usage": None, "devices": [],
+                     "members_visible": pool.member_devices_present(),
+                     "verdict": {"level": "fail", "text": note or "not mounted"}})
+    else:
+        u = report.usage
+        level, text = verdict(report, cfg)
+        devices = []
+        for d in report.devs:
+            known = inv.get(str(d.devid), {})
+            hlevel, htext = device_health(d)
+            devices.append({
+                "devid": d.devid,
+                "name": d.name if d.present else f"was {os.path.basename(known.get('path') or d.path or '?')}",
+                "path": d.path or known.get("path"),
+                "model": d.model or known.get("model"),
+                "serial": d.serial or known.get("serial"),
+                "size": d.size or known.get("size"),
+                "alloc": d.used,
+                "missing": d.missing or not d.present,
+                "present": d.present,
+                "errors": d.errors,
+                "errors_total": sum(d.errors.values()) if d.errors else 0,
+                "smart": d.smart,
+                "health": htext,
+                "health_level": hlevel,
+            })
+        snap.update({
+            "state": report.state_label(),
+            "profiles": u.profiles,
+            "mounted_degraded": report.mounted_degraded,
+            "balance_running": report.balance_running,
+            "usage": {"raw": u.raw, "used": u.used, "data_used": u.data_used, "meta_used": u.meta_used,
+                      "free": u.free, "usable": u.usable, "missing_bytes": u.missing_bytes,
+                      "pct": round(u.used / u.usable * 100, 1) if u.usable else None},
+            "devices": devices,
+            "verdict": {"level": level, "text": text},
+            "missing_since": {k: int(v) for k, v in state.data.get("missing", {}).items()},
+            "rebuild": state.data.get("rebuild"),
+            "scrub": scrub_info(pool),
+        })
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snap, indent=1, ensure_ascii=False))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, p)
+    except OSError as e:
+        LOG.warning("could not write status snapshot %s: %s", path, e)
 
 
 # ---------------------------------------------------------------- monitor
@@ -870,6 +966,7 @@ def cmd_monitor(cfg, args):
 
     if not ensure_mounted(cfg, pool, notifier, state):
         state.save()
+        write_snapshot(cfg, pool, None, state, note=f"{cfg['mountpoint']} is not mounted")
         return
     report = collect(pool)
     update_inventory(state, report.devs)
@@ -977,6 +1074,7 @@ def cmd_monitor(cfg, args):
         state.clear_notify("capacity")
 
     state.save()
+    write_snapshot(cfg, pool, report, state)
     LOG.info("monitor: %s used=%s usable=%s gone=%d", report.state_label(),
              fmt_bytes(u.used), fmt_bytes(u.usable), len(report.gone))
 

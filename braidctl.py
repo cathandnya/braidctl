@@ -66,6 +66,10 @@ DEFAULT_CONFIG = {
         # anything but loopback has to be said out loud.
         "allow_nonloopback": False,
         "allowed_hosts": [],
+        # Source addresses allowed to connect at all, as addresses or CIDRs. Empty means
+        # anything that can reach the socket. Worth setting whenever the socket is not on
+        # loopback: on a tailnet an address cannot be claimed without that peer's key.
+        "allow_from": [],
         # 0600, created on first start. There is deliberately no `token` key here:
         # braid.toml is world-readable and ends up quoted in bug reports.
         "token_file": "/etc/braid/web-token",

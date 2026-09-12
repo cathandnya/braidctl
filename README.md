@@ -160,6 +160,22 @@ reach the machine — `ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a 
 — rather than binding it to the LAN: the token travels in cleartext, and what it opens
 can erase disks.
 
+If you do want it on a socket of its own, bind a **tailnet** address rather than a LAN
+one. Inside WireGuard the traffic is encrypted even over plain HTTP, and a source address
+cannot be claimed without that peer's key — which makes pinning the UI to the one machine
+you use from a real restriction rather than a cosmetic one:
+
+```toml
+[web]
+listen = "100.64.0.1:8765"          # this host's tailnet address
+allow_nonloopback = true
+allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
+allow_from = ["100.64.0.2/32"]      # the laptop, and nothing else
+```
+
+On a LAN an address is a claim rather than a proof, so `allow_from` there is defence in
+depth and not the defence.
+
 From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
 the pool when it is down. Each button shows the exact command first, and the work runs as
 a transient systemd unit rather than inside the request, so a remove that takes hours

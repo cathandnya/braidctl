@@ -24,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import os
 import secrets
@@ -99,6 +100,36 @@ class Auth:
             return (time.time() - int(issued)) < self.ttl
         except ValueError:
             return False
+
+
+def parse_allow_from(nets, log):
+    """[web] allow_from — which source addresses may talk to this at all.
+
+    Loopback plus a token is one gate. When the socket is on a tailnet instead, the
+    source address is worth something: inside WireGuard you cannot claim a peer's
+    address without that peer's key, so pinning the UI to one device is a real
+    restriction rather than a cosmetic one. On a plain LAN it is much weaker — an
+    address there is a claim, not a proof — so it is defence in depth, not the defence."""
+    out = []
+    for n in nets or []:
+        try:
+            out.append(ipaddress.ip_network(n, strict=False))
+        except ValueError as e:
+            raise RuntimeError(f"[web] allow_from: {n!r} is not an address or CIDR ({e})")
+    if out:
+        log.info("web: accepting connections only from %s", ", ".join(str(n) for n in out))
+    return out
+
+
+def client_allowed(networks, addr):
+    if not networks:
+        return True
+    try:
+        # A v6 socket reports v4 clients as ::ffff:a.b.c.d
+        ip = ipaddress.ip_address(addr[7:] if addr.startswith("::ffff:") else addr)
+    except ValueError:
+        return False
+    return any(ip in n for n in networks)
 
 
 class Limiter:
@@ -618,6 +649,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        if not client_allowed(self.ctx["allow_from"], self.client_address[0]):
+            return self.deny(403, "source-not-allowed", "not allowed from this address")
         path, _, query = self.path.partition("?")
         params = {}
         for part in query.split("&"):
@@ -799,6 +832,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
 
     def do_POST(self):
+        if not client_allowed(self.ctx["allow_from"], self.client_address[0]):
+            return self.deny(403, "source-not-allowed", "not allowed from this address")
         path, _, _ = self.path.partition("?")
         if not self.host_ok():
             return self.deny(421, "bad-host", "unexpected Host header")
@@ -946,7 +981,9 @@ def serve(cfg, args, core):
         raise core.BraidError(
             f"refusing to bind {bind}: the token travels in cleartext and what it opens can "
             "erase disks. Put it behind ssh -L, `tailscale serve` or a TLS proxy, or set "
-            "[web] allow_nonloopback = true if you meant it")
+            "[web] allow_nonloopback = true if you meant it — and if you do, bind a tailnet "
+            "address rather than a LAN one and pin it to the devices you use with "
+            "[web] allow_from")
     if not loopback:
         log.warning("listening on %s — anyone who can reach this port and guess nothing "
                     "is one stolen token away from your disks", bind)
@@ -964,6 +1001,7 @@ def serve(cfg, args, core):
     httpd.ctx = {"cfg": cfg, "core": core, "log": log, "auth": auth, "view": view,
                  "assets": assets, "assetdir": str(assetdir), "hosts": hosts,
                  "limiter": Limiter(), "last": time.time(),
+                 "allow_from": parse_allow_from(web["allow_from"], log),
                  "jobs": Jobs(cfg, core, log)}
     fd = systemd_socket()
     if fd is not None:

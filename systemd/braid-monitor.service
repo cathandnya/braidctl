@@ -4,7 +4,10 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/braidctl monitor
+# --if-idle: add / remove がプールのロックを持っている間は静かに諦める。
+# device remove は数時間かかることがあり、その間 5 分ごとに失敗ユニットを
+# 積み上げると、本当に見るべきときに journal が信用されなくなる。
+ExecStart=/usr/local/sbin/braidctl monitor --if-idle
 # 再冗長化 (btrfs device remove) は数時間かかることがある
 TimeoutStartSec=infinity
 Nice=10

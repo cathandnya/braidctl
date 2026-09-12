@@ -73,9 +73,15 @@ class BraidError(Exception):
 
 # ---------------------------------------------------------------- utilities
 
-def run(cmd, check=True, ok_codes=(0,), capture=True):
+def run(cmd, check=True, ok_codes=(0,), capture=True, timeout=None):
     LOG.debug("run: %s", " ".join(cmd))
-    p = subprocess.run(cmd, text=True, capture_output=capture)
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=capture, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A drive behind a dead USB bridge puts btrfs in D state forever. Callers
+        # that have something better to do than wait pass a timeout and get an
+        # error they can report instead of a process that never returns.
+        raise BraidError(f"{' '.join(cmd)} timed out after {timeout}s")
     if check and p.returncode not in ok_codes:
         msg = (p.stderr or p.stdout or "").strip()
         raise BraidError(f"{' '.join(cmd)} failed ({p.returncode}): {msg}")
@@ -145,6 +151,55 @@ def parent_disk(path):
 
 # ---------------------------------------------------------------- state
 
+def lock_holder(path):
+    """Which process holds the pool lock, so a refusal can name it instead of just saying no.
+
+    flock() does not tell you the holder, so match the lock file's inode against every
+    open fd in /proc. Best effort: None when it cannot tell, and the caller just says
+    "something else is running"."""
+    try:
+        target = os.stat(path)
+    except OSError:
+        return None
+    me = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        fddir = f"/proc/{entry}/fd"
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue          # gone, or not ours to look at
+        for fd in fds:
+            try:
+                st = os.stat(f"{fddir}/{fd}")
+            except OSError:
+                continue
+            if st.st_ino == target.st_ino and st.st_dev == target.st_dev:
+                try:
+                    raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+                except OSError:
+                    raw = b""
+                return {"pid": int(entry), "cmdline": raw.decode("utf-8", "replace").replace("\0", " ").strip()}
+    return None
+
+
+def hold_lock(cfg):
+    """Take the pool lock for the rest of this process.
+
+    Only monitor used to lock, which left `braidctl remove 3` free to run while a
+    monitor-driven rebuild was relocating chunks on the same filesystem — two device
+    removes and a balance interleaving, with nothing to stop them. README has claimed
+    "one mutation at a time" all along; this makes it true. The returned object must
+    stay referenced: closing it releases the lock.
+
+    Deliberately not taken by `scrub`, which runs for hours: blocking loss detection
+    for a whole scrub would trade a real protection for a theoretical one."""
+    lock = State(cfg["state_file"])
+    lock.lock()
+    return lock
+
+
 class State:
     """/var/lib/braid/state.json — when each loss was first seen, error/SMART baselines,
     notification rate limiting, and an inventory so a vanished drive can still be named"""
@@ -167,8 +222,16 @@ class State:
                 # re-enumerates and every member device reappears.
                 LOG.info("another braidctl holds the lock; nothing to do")
                 return False
-            raise BraidError("another braidctl is already running (monitor/rebuild)")
+            holder = lock_holder(self.path.with_suffix(".lock"))
+            who = f": {holder['cmdline']}" if holder and holder.get("cmdline") else ""
+            raise BraidError(f"another braidctl is already running{who}. "
+                             "A monitor-driven rebuild holds this for as long as it takes")
         return True
+
+    def unlock(self):
+        if self._lock_fh:
+            self._lock_fh.close()
+            self._lock_fh = None
 
     def load(self):
         if self.path.exists():
@@ -396,9 +459,44 @@ class Pool:
                 stats.setdefault(m[1], {})[m[2]] = int(m[3])
         return stats
 
-    def balance_running(self):
+    def balance_status(self):
+        """btrfs prints "N out of about M chunks balanced (K considered), P% left".
+
+        balance_running() used to throw all of that away and keep the boolean. A
+        balance is the slowest thing this tool starts — hours on a full pool — and
+        the percentage is the only progress it has, so keep it."""
         p = run(["btrfs", "balance", "status", self.mnt], check=False)
-        return "running" in p.stdout or "paused" in p.stdout
+        out = p.stdout
+        info = {"running": "running" in out, "paused": "paused" in out,
+                "pct": None, "chunks_done": None, "chunks_total": None, "considered": None,
+                "text": out.strip().splitlines()[-1] if out.strip() else ""}
+        m = re.search(r"(\d+) out of about (\d+) chunks balanced \((\d+) considered\)", out)
+        if m:
+            info["chunks_done"], info["chunks_total"], info["considered"] = int(m[1]), int(m[2]), int(m[3])
+        m = re.search(r"(\d+)% left", out)
+        if m:
+            info["pct"] = 100 - int(m[1])
+        elif info["chunks_total"]:
+            info["pct"] = round(info["chunks_done"] / info["chunks_total"] * 100, 1)
+        return info
+
+    def balance_running(self):
+        st = self.balance_status()
+        return st["running"] or st["paused"]
+
+    def alloc_by_devid(self):
+        """{devid: (size, alloc)} from one `filesystem show --raw`.
+
+        devices() costs three subprocesses per device (lsblk, SMART, parent_disk), so it
+        cannot be polled. This can: watching a departing device's allocation drain is the
+        only progress a `device remove` has, because btrfs reports none."""
+        p = run(["btrfs", "filesystem", "show", "--raw", self.mnt], check=False)
+        out = {}
+        for line in p.stdout.splitlines():
+            m = re.search(r"devid\s+(\d+)\s+size\s+(\d+)\s+used\s+(\d+)", line)
+            if m:
+                out[int(m[1])] = (int(m[2]), int(m[3]))
+        return out
 
     def scrub_status(self, raw=False, per_device=False):
         argv = ["btrfs", "scrub", "status"]
@@ -429,11 +527,13 @@ class Pool:
             "power_on_hours": j.get("power_on_time", {}).get("hours"),
         }
 
-    def enrich(self, devs):
+    def enrich(self, devs, smart=True):
         stats = self.dev_stats()
         for d in devs:
             d.errors = stats.get(d.path) or stats.get(f"devid:{d.devid}") or {}
-            d.smart = self.smart(d)
+            # smartctl takes seconds per drive behind a USB bridge and spins up a
+            # sleeping one. Callers that refresh often read it on their own clock.
+            d.smart = self.smart(d) if smart else {}
         return devs
 
     # -- mutations
@@ -508,8 +608,8 @@ class Report:
         return "UNPROTECTED"
 
 
-def collect(pool):
-    devs = pool.enrich(pool.devices())
+def collect(pool, smart=True):
+    devs = pool.enrich(pool.devices(), smart=smart)
     m = pool.mount_entry() or {"options": []}
     return Report(devs=devs, usage=pool.usage(),
                   mounted_degraded="degraded" in m["options"],
@@ -589,7 +689,7 @@ def verdict(report, cfg):
                     + ". Consider adding a drive")
 
 
-def render_status(report, cfg, state=None, scrub=None):
+def render_status(report, cfg, state=None, scrub=None, balance=None):
     u = report.usage
     lines = []
     label = report.state_label()
@@ -618,7 +718,11 @@ def render_status(report, cfg, state=None, scrub=None):
     if pct >= cfg["warn_percent"]:
         lines.append(f"Warning: {pct:.0f}% full. Rebuilds (balance) fail when free space runs short")
     if report.balance_running:
-        lines.append("Balance in progress; performance is reduced until it finishes")
+        b = balance if balance is not None else {}
+        pct = f" ({b['pct']:.0f}%)" if b.get("pct") is not None else ""
+        chunks = (f", {b['chunks_done']} of about {b['chunks_total']} chunks"
+                  if b.get("chunks_total") else "")
+        lines.append(f"Balance in progress{pct}{chunks}; performance is reduced until it finishes")
     if scrub and scrub.get("started"):
         when = time.strftime("%Y-%m-%d", time.localtime(scrub["started"]))
         lines.append(f"Last scrub {when} ({scrub.get('status') or '?'}): {scrub['text']}")
@@ -695,6 +799,7 @@ def check_addable(cfg, pool, dev, force):
 
 def cmd_add(cfg, args):
     require_root()
+    lock = hold_lock(cfg)                      # noqa: F841 — released when this returns
     pool = Pool(cfg)
     if not pool.is_mounted():
         raise BraidError(f"{cfg['mountpoint']} is not mounted")
@@ -735,6 +840,7 @@ def resolve_target(pool, target):
 
 def cmd_remove(cfg, args):
     require_root()
+    lock = hold_lock(cfg)                      # noqa: F841 — released when this returns
     pool = Pool(cfg)
     if not pool.is_mounted():
         raise BraidError(f"{cfg['mountpoint']} is not mounted")
@@ -872,12 +978,19 @@ def scrub_info(pool, state=None, report=None):
     """Parse `btrfs scrub status` into a small dict, with braidctl's own reading of it"""
     out = {}
     for line in pool.scrub_status().splitlines():
-        m = re.match(r"\s*(Status|Scrub started|Scrub resumed|Duration|Total to scrub|Rate|Error summary):\s+(.*)", line)
+        m = re.match(r"\s*(Status|Scrub started|Scrub resumed|Duration|Total to scrub|Rate|Error summary"
+                     r"|Time left|ETA|Bytes scrubbed):\s+(.*)", line)
         if m:
             out[m[1]] = m[2].strip()
     info = {"status": out.get("Status"), "started": None, "duration": out.get("Duration"),
             "total": out.get("Total to scrub"), "rate": out.get("Rate"),
-            "error_summary": out.get("Error summary")}
+            "error_summary": out.get("Error summary"),
+            # only present while one is running
+            "scrubbed": out.get("Bytes scrubbed"), "time_left": out.get("Time left"),
+            "eta": out.get("ETA"), "pct": None}
+    m = re.search(r"\(([\d.]+)%\)", out.get("Bytes scrubbed") or "")
+    if m:
+        info["pct"] = float(m[1])
     if out.get("Scrub started"):
         try:
             info["started"] = int(time.mktime(time.strptime(out["Scrub started"], "%a %b %d %H:%M:%S %Y")))
@@ -897,12 +1010,14 @@ def scrub_info(pool, state=None, report=None):
     return info
 
 
-def write_snapshot(cfg, pool, report, state, note=None):
-    """World-readable JSON of what monitor just saw, so a dashboard running without root
-    can show the pool. Everything btrfs reports about devices and usage needs root."""
-    path = cfg.get("status_file")
-    if not path:
-        return
+def snapshot_dict(cfg, pool, report, state, note=None):
+    """The whole picture as one JSON-able dict: capacity, protection, per-drive health,
+    the verdict line, rebuild and scrub state.
+
+    Split out of write_snapshot so that anything serving this — the status file a
+    dashboard reads, an HTTP handler — builds it from one place. Two producers of the
+    same shape drift, and a dashboard that disagrees with `braidctl status` is worse
+    than no dashboard."""
     snap = {"version": 1, "generated_at": int(time.time()),
             "mountpoint": cfg["mountpoint"], "label": cfg["label"]}
     inv = state.data.get("inventory", {})
@@ -946,7 +1061,18 @@ def write_snapshot(cfg, pool, report, state, note=None):
             "missing_since": {k: int(v) for k, v in state.data.get("missing", {}).items()},
             "rebuild": state.data.get("rebuild"),
             "scrub": scrub_info(pool, state, report),
+            "balance": pool.balance_status(),
         })
+    return snap
+
+
+def write_snapshot(cfg, pool, report, state, note=None):
+    """World-readable copy of the above, so a dashboard running without root can show
+    the pool. Everything btrfs reports about devices and usage needs root."""
+    path = cfg.get("status_file")
+    if not path:
+        return
+    snap = snapshot_dict(cfg, pool, report, state, note)
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1005,6 +1131,16 @@ def ensure_mounted(cfg, pool, notifier, state):
     return True
 
 
+def cancel_scrub_for_rebuild(pool):
+    """Re-protecting the pool outranks verifying it. A scrub holds the disks for hours;
+    a rebuild that waits for one is a rebuild that has not started."""
+    if "running" not in pool.scrub_status():
+        return False
+    LOG.warning("cancelling the running scrub: a rebuild needs the disks")
+    run(["btrfs", "scrub", "cancel", pool.mnt], check=False)
+    return True
+
+
 def rebuild_missing(cfg, pool, notifier, state, report):
     """Evict the missing devices and restore raid1 across the survivors (Drobo's re-layout)"""
     gone = report.gone
@@ -1018,6 +1154,7 @@ def rebuild_missing(cfg, pool, notifier, state, report):
                   f"Usable afterwards {fmt_bytes(after)} / used {fmt_bytes(needed)}\n"
                   "This takes a while; you will get another message when it finishes.")
     try:
+        cancel_scrub_for_rebuild(pool)
         pool.compact()
         # 1) Try removing by devid on the live filesystem (works when the kernel tracks the loss)
         live_ok = True
@@ -1273,9 +1410,15 @@ def cmd_scrub(cfg, args):
     if not pool.is_mounted():
         raise BraidError(f"{cfg['mountpoint']} is not mounted")
     if args.ack:
+        lock = hold_lock(cfg)                  # noqa: F841 — a state.json write
         return scrub_ack(cfg, pool)
     if "running" in pool.scrub_status():
         raise BraidError("a scrub is already running")
+    # What `Conflicts=braid-monitor.service` was reaching for, in the one place that can
+    # actually express it. The unit-level version stopped the scrub every time the
+    # five-minute monitor timer fired, so a monthly scrub never finished.
+    if pool.balance_running():
+        raise BraidError("a balance is running (rebuild or rebalance); scrub once it finishes")
     LOG.info("scrub starting")
     p = run(["btrfs", "scrub", "start", "-B", "-d", cfg["mountpoint"]], check=False)
     state = State(cfg["state_file"]).load()

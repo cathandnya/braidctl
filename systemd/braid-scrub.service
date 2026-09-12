@@ -1,8 +1,11 @@
 [Unit]
 Description=braid pool scrub (verify all data against checksums)
 After=local-fs.target
-# monitor の再構築中は走らせない
-Conflicts=braid-monitor.service
+# Conflicts=braid-monitor.service は置かない。systemd の Conflicts は対称に働くので、
+# 5 分ごとの monitor タイマーが起動するたびに走行中の scrub が停止させられ、月次 scrub が
+# 一度も完走しなかった。「再構築中は scrub しない」という意図は braidctl 側の
+# インターロック（balance 実行中は scrub を断る / 再構築は走行中の scrub をキャンセルする）
+# で表現している。
 
 [Service]
 Type=oneshot

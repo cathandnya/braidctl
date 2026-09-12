@@ -33,10 +33,12 @@ protected_devices = []
 [web]
 # The optional web view. Nothing here starts anything: it exists only while
 # braid-web.socket is enabled, or while `braidctl web` is running in a terminal.
+# Loopback by default. Anything else is reachable by whatever can route to it, and the
+# token that guards a root-privileged UI then travels in cleartext. Two shapes that make
+# sense: a LAN address with read_only = true (nothing to break), or a tailnet address
+# with allow_from (WireGuard encrypts it and an address cannot be claimed without that
+# peer's key). The tool does not argue with either; see the README.
 listen = "127.0.0.1:8765"
-# The token travels in cleartext and what it opens can erase disks. Put the UI behind
-# `ssh -L`, `tailscale serve` or a TLS proxy rather than binding it to the LAN.
-allow_nonloopback = false
 allowed_hosts = []              # extra Host: values to accept, e.g. a reverse proxy name
 # Source addresses allowed to connect at all (addresses or CIDRs; empty means anything
 # that reaches the socket). Worth setting whenever this is not on loopback — and worth

@@ -976,17 +976,19 @@ def serve(cfg, args, core):
         print(f"http://{host if ':' not in host else '[' + host + ']'}:{port}/?token={auth.token}")
         return None
 
+    # The default is loopback and the README says why. Someone who writes a different
+    # listen address has already said what they want, and a second flag to confirm it
+    # would be friction rather than a defence. State the cost and then do as asked —
+    # what the pool is exposed to is the operator's call, not this file's.
     loopback = host in ("127.0.0.1", "::1", "localhost")
-    if not loopback and not web["allow_nonloopback"]:
-        raise core.BraidError(
-            f"refusing to bind {bind}: the token travels in cleartext and what it opens can "
-            "erase disks. Put it behind ssh -L, `tailscale serve` or a TLS proxy, or set "
-            "[web] allow_nonloopback = true if you meant it — and if you do, bind a tailnet "
-            "address rather than a LAN one and pin it to the devices you use with "
-            "[web] allow_from")
     if not loopback:
-        log.warning("listening on %s — anyone who can reach this port and guess nothing "
-                    "is one stolen token away from your disks", bind)
+        log.warning("listening on %s, not loopback: the token travels in cleartext and "
+                    "opens a root-privileged UI. On a tailnet address WireGuard encrypts "
+                    "that and [web] allow_from can pin it to one device; on a LAN it is "
+                    "neither.", bind)
+        if not web["allow_from"]:
+            log.warning("[web] allow_from is empty: anything that can reach %s may try the "
+                        "token. [web] read_only = true removes the mutating routes entirely.", bind)
 
     assetdir, assets = load_assets([a for a in (web["assets"], str(Path(core.__file__).resolve().parent / "web"),
                                                 "/usr/local/share/braidctl/web") if a])

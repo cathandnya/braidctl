@@ -61,10 +61,10 @@ DEFAULT_CONFIG = {
     # The optional web view. Nothing here starts anything: it exists only while
     # braid-web.socket is enabled or `braidctl web` is running.
     "web": {
+        # Loopback by default. Changing it is one line and the tool will not argue;
+        # what the pool is exposed to is the operator's call. See the README for the
+        # shapes that make sense (LAN plus read_only, tailnet plus allow_from).
         "listen": "127.0.0.1:8765",
-        # The token travels in cleartext and what it opens can erase disks, so binding
-        # anything but loopback has to be said out loud.
-        "allow_nonloopback": False,
         "allowed_hosts": [],
         # Source addresses allowed to connect at all, as addresses or CIDRs. Empty means
         # anything that can reach the socket. Worth setting whenever the socket is not on

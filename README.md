@@ -155,26 +155,39 @@ sudo systemctl enable --now braid-web.socket
 sudo braidctl web --url          # http://127.0.0.1:8765/?token=...
 ```
 
-It binds loopback and requires a token. Reach it from elsewhere the way you already
-reach the machine — `ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a TLS proxy
-— rather than binding it to the LAN: the token travels in cleartext, and what it opens
-can erase disks.
+It binds loopback and requires a token, which is the shape that assumes least. Where it
+goes from there is your call; the tool will not argue, but it will say what each shape
+costs.
 
-If you do want it on a socket of its own, bind a **tailnet** address rather than a LAN
-one. Inside WireGuard the traffic is encrypted even over plain HTTP, and a source address
-cannot be claimed without that peer's key — which makes pinning the UI to the one machine
-you use from a real restriction rather than a cosmetic one:
+**Watch the pool from anywhere on the LAN.** `read_only` refuses every mutation at the
+dispatcher, so there is nothing to break even if the token gets out:
+
+```toml
+[web]
+listen = "192.168.1.10:8765"
+allowed_hosts = ["nas.local:8765", "192.168.1.10:8765"]
+read_only = true
+```
+
+**Run it from one machine.** A tailnet address rather than a LAN one: inside WireGuard the
+traffic is encrypted even over plain HTTP, and an address cannot be claimed without that
+peer's key, which makes pinning the UI to one device a real restriction rather than a
+cosmetic one. On a LAN an address is a claim, not a proof, so `allow_from` there is
+defence in depth and not the defence:
 
 ```toml
 [web]
 listen = "100.64.0.1:8765"          # this host's tailnet address
-allow_nonloopback = true
 allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
 allow_from = ["100.64.0.2/32"]      # the laptop, and nothing else
 ```
 
-On a LAN an address is a claim rather than a proof, so `allow_from` there is defence in
-depth and not the defence.
+**Leave it on loopback** and reach it the way you already reach the machine —
+`ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a TLS proxy in front.
+
+Whatever you pick, the token travels in cleartext over plain HTTP, and what it opens can
+add and remove drives. `allow_force_add` (the one irreversible operation) stays off unless
+you turn it on.
 
 From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
 the pool when it is down. Each button shows the exact command first, and the work runs as

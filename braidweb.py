@@ -633,6 +633,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.ctx["limiter"].ok(self.client_address[0])
             return True
         self.ctx["limiter"].fail(self.client_address[0])
+        # A browser that followed a link (from a dashboard, a bookmark) gets a page
+        # telling it what to do. A JSON body in the viewport is not an answer.
+        if "text/html" in (self.headers.get("Accept") or "") and not self.path.startswith("/api/"):
+            self.ctx["log"].warning("refused %s from %s: no-credential",
+                                    self.path, self.client_address[0])
+            body = ("<!doctype html><meta charset=utf-8><title>braid</title>"
+                    "<style>body{font:15px/1.6 ui-sans-serif,system-ui;margin:0;padding:40px;"
+                    "background:#16171a;color:#e6e5e1}code{background:#0e0f11;border:1px solid #2c2e33;"
+                    "border-radius:4px;padding:2px 6px;user-select:all}"
+                    "@media(prefers-color-scheme:light){body{background:#f7f7f5;color:#1b1b19}"
+                    "code{background:#fff;border-color:#dedcd6}}</style>"
+                    "<h1>braid</h1><p>This page needs the token that guards it.</p>"
+                    "<p>On the machine that runs the pool:</p>"
+                    "<p><code>sudo braidctl web --url</code></p>"
+                    "<p>Open the URL it prints. It sets a cookie, so this is once per browser "
+                    "until the session expires.</p>").encode()
+            return self.respond(401, body, "text/html; charset=utf-8")
         wait = self.ctx["limiter"].blocked(self.client_address[0])
         if wait:
             self.send_response(429)

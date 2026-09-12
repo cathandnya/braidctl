@@ -33,11 +33,8 @@ protected_devices = []
 [web]
 # The optional web view. Nothing here starts anything: it exists only while
 # braid-web.socket is enabled, or while `braidctl web` is running in a terminal.
-# Loopback by default. This serves plain HTTP and always will — TLS belongs to whatever
-# is in front of it. Shapes that make sense, all of them fine, see the README:
-#   a TLS proxy in front      keep this on loopback, set cookie_secure and allowed_hosts
-#   a tailnet address         WireGuard already encrypts the path; pin it with allow_from
-#   a LAN address             nothing encrypts that, so pair it with read_only = true
+# Loopback by default. This serves plain HTTP; whatever encrypts the path goes in front
+# of it. The README has example configurations (TLS proxy, tailnet, LAN with read_only).
 listen = "127.0.0.1:8765"
 allowed_hosts = []              # extra Host: values to accept, e.g. a reverse proxy name
 # Source addresses allowed to connect at all (addresses or CIDRs; empty means anything

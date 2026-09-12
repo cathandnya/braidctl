@@ -155,55 +155,47 @@ sudo systemctl enable --now braid-web.socket
 sudo braidctl web --url          # http://127.0.0.1:8765/?token=...
 ```
 
-It binds loopback and requires a token, which is the shape that assumes least. Where it
-goes from there is your call; the tool will not argue, but it will say what each shape
-costs.
+It binds loopback and requires a token. **Where you host it from there is a separate
+question** — it speaks plain HTTP and always will, because a certificate store is not
+something a storage tool should own, so whatever encrypts the path sits in front of it.
+braidctl gives you the settings and stays out of the decision.
 
-**Watch the pool from anywhere on the LAN.** `read_only` refuses every mutation at the
-dispatcher, so there is nothing to break even if the token gets out:
+What is worth knowing before putting it anywhere:
+
+- the token is a bearer credential. Whoever holds it can do whatever the UI can do, which
+  includes adding and removing drives. It lives in a 0600 file and is never logged
+- `read_only = true` refuses every mutating route at the dispatcher
+- `allow_force_add` — `wipefs`, the one irreversible operation — is off unless you turn it on
+- `allowed_hosts` is a Host-header allowlist (DNS rebinding); any name a browser uses has
+  to be in it or the request is refused
+- `allow_from` restricts source addresses. Behind a proxy it sees the proxy, not the
+  browser: `X-Forwarded-For` is deliberately not trusted, so restrict clients at the proxy
+- an address is proof of nothing on a LAN, and proof of a key on a tailnet
+
+Some configurations, as examples:
 
 ```toml
+# behind a TLS proxy (nginx, Caddy, `tailscale serve`)
+[web]
+listen = "127.0.0.1:8765"
+allowed_hosts = ["nas.example.net"]     # the name the browser uses, as the proxy passes it
+cookie_secure = true
+
+# on a tailnet, one machine only
+[web]
+listen = "100.64.0.1:8765"              # this host's tailnet address
+allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
+allow_from = ["100.64.0.2/32"]
+
+# on a LAN, nothing to break
 [web]
 listen = "192.168.1.10:8765"
 allowed_hosts = ["nas.local:8765", "192.168.1.10:8765"]
 read_only = true
 ```
 
-**Run it from one machine.** A tailnet address rather than a LAN one: inside WireGuard the
-traffic is encrypted even over plain HTTP, and an address cannot be claimed without that
-peer's key, which makes pinning the UI to one device a real restriction rather than a
-cosmetic one. On a LAN an address is a claim, not a proof, so `allow_from` there is
-defence in depth and not the defence:
-
-```toml
-[web]
-listen = "100.64.0.1:8765"          # this host's tailnet address
-allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
-allow_from = ["100.64.0.2/32"]      # the laptop, and nothing else
-```
-
-**Put TLS in front.** braidctl speaks plain HTTP and always will — a certificate store is
-not something a storage tool should own. nginx, Caddy or `tailscale serve` terminating
-HTTPS is a perfectly good answer, including on a LAN, and then none of the cleartext
-caveats above apply:
-
-```toml
-[web]
-listen = "127.0.0.1:8765"                  # the proxy is the only thing that reaches it
-allowed_hosts = ["nas.example.net"]        # the name the browser uses, as the proxy passes it
-cookie_secure = true                       # the session cookie is then HTTPS-only
-```
-
-Note that `allow_from` sees the proxy's address, not the browser's — this deliberately
-does not trust `X-Forwarded-For`, since a forwarded header is only worth what the hop in
-front of it is worth. Restrict clients at the proxy instead.
-
-**Leave it on loopback** and reach it the way you already reach the machine —
+Or leave it on loopback and reach it the way you already reach the machine:
 `ssh -L 8765:127.0.0.1:8765 nas`.
-
-The token is a bearer credential: whoever has it can do whatever the UI can do, so it is
-worth keeping the path encrypted and the file at 0600. `allow_force_add` (the one
-irreversible operation) stays off unless you turn it on.
 
 From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
 the pool when it is down. Each button shows the exact command first, and the work runs as

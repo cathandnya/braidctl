@@ -145,6 +145,29 @@ nas-monitor-style config; point `notify.config_file` at any JSON
 file with a `notification.email` object of `{smtp_server, smtp_port, username, password, from, to,
 use_tls}`. Without one, everything still lands in the journal — `journalctl -u braid-monitor`.
 
+## Web UI
+
+An optional browser view of `braidctl status`, in the same words: the usable-capacity
+number, the verdict line, per-drive health, and what the last scrub found.
+
+```bash
+sudo systemctl enable --now braid-web.socket
+sudo braidctl web --url          # http://127.0.0.1:8765/?token=...
+```
+
+It binds loopback and requires a token. Reach it from elsewhere the way you already
+reach the machine — `ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a TLS proxy
+— rather than binding it to the LAN: the token travels in cleartext, and what it opens
+can erase disks.
+
+**The pool does not depend on it.** Detection, re-protection and the boot mount are
+timers and udev rules that never call into it. It is socket-activated, so between visits
+no braidctl process is resident at all, and it exits again when left idle.
+`systemctl stop braid-web.socket` returns the machine to exactly what it was.
+
+`braidctl web --listen 127.0.0.1:8765` runs it in the foreground instead, which is what
+the loop-device testbed and a non-systemd host use.
+
 ## Reading a scrub result
 
 btrfs counts scrub errors by class, and the classes are not equally serious. `braidctl status` says

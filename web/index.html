@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>braid</title>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%A7%B5%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<noscript>
+  <p class="banner warn">This page needs JavaScript. Without it, <a href="/?plain=1">/?plain=1</a>
+  returns the same text as <code>sudo braidctl status</code>.</p>
+</noscript>
+
+<header>
+  <h1><span id="label">braid</span> <span class="dim" id="mountpoint"></span></h1>
+  <span class="chip" id="state">—</span>
+  <span class="chip dim" id="profiles" hidden></span>
+  <span class="chip warn" id="degraded" hidden>mounted degraded</span>
+</header>
+
+<div id="banners"></div>
+
+<section class="card">
+  <div class="headline">
+    <div>
+      <div class="big" id="usable">—</div>
+      <div class="dim">usable</div>
+    </div>
+    <dl class="figures">
+      <div><dt>raw</dt><dd id="raw">—</dd></div>
+      <div><dt>used</dt><dd id="used">—</dd></div>
+      <div><dt>free</dt><dd id="free">—</dd></div>
+    </dl>
+  </div>
+  <div class="bar"><div id="bar-used"></div></div>
+  <p class="verdict" id="verdict">—</p>
+</section>
+
+<section class="card">
+  <h2>Drives</h2>
+  <table id="drives">
+    <thead><tr><th>ID</th><th>device</th><th>model</th><th class="num">size</th><th class="num">alloc</th><th class="num">errors</th><th>health</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="card" id="scrub-card">
+  <h2>Last scrub</h2>
+  <p id="scrub">—</p>
+</section>
+
+<footer>
+  <span id="source">—</span> ·
+  <span id="smart-age"></span> ·
+  <span id="lock"></span>
+  <a href="/?plain=1">plain text</a>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

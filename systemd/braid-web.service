@@ -1,0 +1,23 @@
+[Unit]
+Description=braidctl web view (optional, read-only)
+Documentation=https://github.com/cathandnya/braidctl
+Requires=braid-web.socket
+After=braid-web.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/braidctl web
+Restart=no
+Nice=5
+
+# このプロセスは mount も btrfs の変更も実行しない（プールを変える操作は pid 1 が
+# 起動する transient unit 側で走る）ので、ここまで締められる。
+# 逆に言うと、将来「web プロセスから直接 mount すればいい」と変更すると
+# PrivateTmp/PrivateMounts の下で誰にも見えない mount ができあがる。やらないこと。
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/braid /etc/braid
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+MemoryMax=256M
+TasksMax=64

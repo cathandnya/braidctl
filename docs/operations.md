@@ -29,6 +29,33 @@ sudo btrfs scrub status /srv/pool           # last scrub result
 systemctl list-timers 'braid-*'
 ```
 
+## The web UI
+
+Optional, off until you turn it on, and nothing about the pool depends on it.
+
+```bash
+sudo systemctl enable --now braid-web.socket   # pid 1 holds the socket; nothing is resident
+sudo braidctl web --url                        # the URL, with its token
+ssh -L 8765:127.0.0.1:8765 nas                 # how to reach it from a laptop or phone
+```
+
+It shows what `braidctl status` shows. It is read-only in this version: there is no route
+that changes the pool, and POST is refused outright.
+
+The token lives in `/etc/braid/web-token` (0600, created on first start). Rotating it is
+`rm` plus a restart, which invalidates every open session:
+
+```bash
+sudo rm /etc/braid/web-token
+sudo systemctl restart braid-web.socket
+```
+
+Evidence lives where the rest of braidctl's does — `journalctl -u braid-web`. Refusals are
+logged by class (`bad-host`, `bad-credential`), never with the value that was offered.
+
+If anything about it looks wrong, `sudo systemctl stop braid-web.socket`. Nothing about the
+pool depends on it.
+
 ## Adding a drive
 
 ```bash

@@ -1,0 +1,11 @@
+[Unit]
+Description=braidctl web view socket
+Documentation=https://github.com/cathandnya/braidctl
+
+[Socket]
+# /etc/braid/braid.toml の [web] listen と一致させること。socket 起動のときは
+# こちらが実際の待ち受けアドレスになる。
+ListenStream=127.0.0.1:8765
+
+[Install]
+WantedBy=sockets.target

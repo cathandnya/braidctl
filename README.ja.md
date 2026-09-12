@@ -143,6 +143,28 @@ nas-monitor 形式の既存設定から SMTP ブロックを借りる。
 JSON なら何でも `notify.config_file` に指定できる。設定が無くても全部ジャーナルには残る —
 `journalctl -u braid-monitor`。
 
+## Web UI
+
+`braidctl status` をブラウザで見るための、任意の追加機能。出す内容も言葉も CLI と同じで、
+使える容量の数字、判定文、各ドライブの健康状態、直近の scrub の結果。
+
+```bash
+sudo systemctl enable --now braid-web.socket
+sudo braidctl web --url          # http://127.0.0.1:8765/?token=...
+```
+
+待ち受けはループバックのみ、トークン必須。外から見るときは、その機械にいつも使っている経路
+（`ssh -L 8765:127.0.0.1:8765 nas`、`tailscale serve`、TLS の前段）を使う。LAN に直接開かない
+こと。トークンは平文で流れ、その先はディスクを消せる。
+
+**プールはこれに依存していない。** 脱落の検知も再冗長化も起動時のマウントも、タイマーと udev
+ルールがやることで、この UI を通らない。socket activation なので**見ていない間は braidctl の
+プロセスが 1 つも常駐せず**、放置すればまた終了する。`systemctl stop braid-web.socket` で
+導入前の機械に戻る。
+
+`braidctl web --listen 127.0.0.1:8765` なら前面で動く。ループバックの検証環境や systemd の
+無いホストはこちら。
+
 ## scrub の結果の読み方
 
 btrfs は scrub のエラーを種類別に数えていて、種類によって深刻さが違う。`braidctl status` はどちら

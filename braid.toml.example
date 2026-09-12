@@ -30,6 +30,24 @@ error_threshold = 10
 # Put anything here that must never be absorbed into the pool by a mistyped device node.
 protected_devices = []
 
+[web]
+# The optional web view. Nothing here starts anything: it exists only while
+# braid-web.socket is enabled, or while `braidctl web` is running in a terminal.
+listen = "127.0.0.1:8765"
+# The token travels in cleartext and what it opens can erase disks. Put the UI behind
+# `ssh -L`, `tailscale serve` or a TLS proxy rather than binding it to the LAN.
+allow_nonloopback = false
+allowed_hosts = []              # extra Host: values to accept, e.g. a reverse proxy name
+# 0600, created on first start. There is deliberately no `token = ` key: this file is
+# world-readable and ends up quoted in bug reports.
+token_file = "/etc/braid/web-token"
+session_ttl_sec = 604800
+cookie_secure = false           # true if you terminate TLS in front of it
+smart_ttl_sec = 900             # smartctl is slow and wakes sleeping drives
+btrfs_ttl_sec = 3
+idle_exit_sec = 900             # socket activation: exit when idle. 0 = stay up
+assets = ""                     # "" = next to braidctl, then /usr/local/share/braidctl/web
+
 [notify]
 # Any JSON file with a notification.email object of
 #   {smtp_server, smtp_port, username, password, from, to, use_tls}

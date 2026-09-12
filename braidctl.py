@@ -58,6 +58,28 @@ DEFAULT_CONFIG = {
     "error_threshold": 10,
     # Substrings of /dev/disk/by-id names that `add` must always refuse
     "protected_devices": [],
+    # The optional web view. Nothing here starts anything: it exists only while
+    # braid-web.socket is enabled or `braidctl web` is running.
+    "web": {
+        "listen": "127.0.0.1:8765",
+        # The token travels in cleartext and what it opens can erase disks, so binding
+        # anything but loopback has to be said out loud.
+        "allow_nonloopback": False,
+        "allowed_hosts": [],
+        # 0600, created on first start. There is deliberately no `token` key here:
+        # braid.toml is world-readable and ends up quoted in bug reports.
+        "token_file": "/etc/braid/web-token",
+        "session_ttl_sec": 604800,
+        "cookie_secure": False,
+        # smartctl is slow behind a USB bridge and wakes sleeping drives, so the web
+        # view refreshes it on its own clock and never inside a request.
+        "smart_ttl_sec": 900,
+        "btrfs_ttl_sec": 3,
+        # Socket-activated: exit when nobody is looking, so nothing of braidctl is
+        # resident between visits. 0 stays up; ignored when run in the foreground.
+        "idle_exit_sec": 900,
+        "assets": "",
+    },
     "notify": {
         # Borrow the SMTP block from an existing nas-monitor-style config
         "config_file": "/etc/nas-monitor/config.json",
@@ -1437,6 +1459,24 @@ def cmd_scrub(cfg, args):
         notifier.send("Scrub finished, no errors", body)
 
 
+def cmd_web(cfg, args):
+    """Hand over to braidweb, which is a separate file on purpose.
+
+    braidctl.py is what removes devices from a live filesystem; it should stay short
+    enough to read in one sitting, and a broken or missing web module must not be able
+    to take the monitor with it. This is the only subcommand that can fail to import."""
+    require_root()
+    here = Path(__file__).resolve().parent
+    for d in (here, Path("/usr/local/lib/braidctl")):
+        if (d / "braidweb.py").exists():
+            sys.path.insert(0, str(d))
+            break
+    else:
+        raise BraidError("braidweb.py not found next to braidctl or in /usr/local/lib/braidctl")
+    import braidweb
+    return braidweb.serve(cfg, args, core=sys.modules[__name__])
+
+
 def cmd_guard(cfg, args):
     """Unmount a pool that can no longer write, so writes fail loudly instead of vanishing.
 
@@ -1571,6 +1611,11 @@ def main(argv=None):
     s.add_argument("--wait", type=int, default=0,
                    help="seconds to keep retrying while the drives appear (boot)")
     s.set_defaults(fn=cmd_mount)
+
+    s = sub.add_parser("web", help="serve the optional read-only web view (loopback + token)")
+    s.add_argument("--listen", help="host:port to bind (default from braid.toml)")
+    s.add_argument("--url", action="store_true", help="print the URL with its token and exit")
+    s.set_defaults(fn=cmd_web)
 
     s = sub.add_parser("mount-degraded", help="mount with a drive missing")
     s.set_defaults(fn=cmd_mount_degraded)

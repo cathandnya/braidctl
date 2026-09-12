@@ -54,7 +54,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   table thead { display: none; }
   table, tbody, tr, td { display: block; width: 100%; }
   tr { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-bottom: 8px; }
-  td { border: 0; padding: 2px 0; text-align: left; }
+  td, td.num { border: 0; padding: 2px 0; text-align: left; }
   td::before { content: attr(data-k) " "; color: var(--dim); }
 }
 

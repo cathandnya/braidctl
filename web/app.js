@@ -272,13 +272,17 @@
     $('job-head').textContent = `${job.action} — ${job.state}${started ? `, started ${started}` : ''}`
       + (elapsed ? `, ${elapsed}` : '') + (job.exit !== null && job.exit !== undefined ? `, exit ${job.exit}` : '');
     const p = job.progress || {};
+    const running = ['queued', 'running'].includes(job.state);
     const bar = $('job-bar');
+    // An empty bar under a finished job reads as "stuck at zero".
+    bar.parentElement.hidden = !running || p.pct === null || p.pct === undefined;
     bar.style.width = (p.pct !== null && p.pct !== undefined ? Math.min(100, p.pct) : 0) + '%';
     $('job-detail').textContent = [p.phase, p.pct !== null && p.pct !== undefined ? p.pct + '%' : null,
       p.detail, p.time_left ? p.time_left + ' left' : null].filter(Boolean).join(' · ');
     // Cancel only where cancelling means anything: btrfs keeps relocating after a
     // device remove is interrupted, so a button there would be a lie.
     $('job-cancel').hidden = !(job.cancellable && job.state === 'running');
+    $('job-log').hidden = !$('job-log').textContent;
     if (job.error) banner('fail', `${job.action}: ${job.error}`);
   }
 

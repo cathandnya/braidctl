@@ -525,6 +525,10 @@ def candidates(core, cfg, allow_force):
             entry["reason"] = reason
         except Exception as e:
             entry["status"], entry["reason"] = "unknown", str(e)
+        # A refused real disk is worth showing — the operator may be hunting for it. A
+        # refused loop device is a snap mount, and every machine has a pile of them.
+        if node.get("type") == "loop" and entry["status"] == "refused":
+            continue
         out.append(entry)
     return out
 

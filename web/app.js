@@ -136,6 +136,115 @@
     $('lock').textContent = d.lock && d.lock.held ? `busy: ${d.lock.cmdline || 'another braidctl'}` : '';
   }
 
+  // --- actions ------------------------------------------------------------
+  // Every button opens one dialog showing the exact command the server will run.
+  // That is the trust mechanism: this is a thing you could have typed yourself.
+  const COMMANDS = {
+    scrub: { cmd: 'braidctl scrub',
+             note: 'Reads every block and checks it against its checksum. Takes hours and uses every drive at once.' },
+    monitor: { cmd: 'braidctl monitor',
+               note: 'One detection pass, the same one the five-minute timer runs.' },
+  };
+
+  let pending = null;
+
+  function askConfirm(action) {
+    const spec = COMMANDS[action];
+    pending = action;
+    $('confirm-title').textContent = spec.cmd;
+    $('confirm-cmd').textContent = 'sudo ' + spec.cmd;
+    $('confirm-note').textContent = spec.note;
+    $('confirm').showModal();
+  }
+
+  async function post(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Braid-CSRF': '1' },
+      body: JSON.stringify(body || {}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    return d;
+  }
+
+  function wireActions() {
+    for (const b of document.querySelectorAll('[data-action]')) {
+      b.addEventListener('click', () => askConfirm(b.dataset.action));
+    }
+    $('confirm-no').addEventListener('click', () => { $('confirm').close(); pending = null; });
+    $('confirm-yes').addEventListener('click', async () => {
+      $('confirm').close();
+      const action = pending;
+      pending = null;
+      try {
+        const job = await post('/api/jobs', { action });
+        current = { id: job.id, offset: 0 };
+        $('job-log').textContent = '';
+        pollJob();
+      } catch (e) {
+        banner('fail', e.message);
+      }
+    });
+    $('job-cancel').addEventListener('click', async () => {
+      if (!current) return;
+      try { await post(`/api/jobs/${current.id}/cancel`); } catch (e) { banner('fail', e.message); }
+    });
+  }
+
+  // --- jobs ---------------------------------------------------------------
+  let current = null;
+
+  function renderJob(job) {
+    $('job-card').hidden = false;
+    const started = job.started ? new Date(job.started * 1000).toLocaleTimeString() : '';
+    const elapsed = job.started ? duration((job.finished || Date.now() / 1000) - job.started) : '';
+    $('job-head').textContent = `${job.action} — ${job.state}${started ? `, started ${started}` : ''}`
+      + (elapsed ? `, ${elapsed}` : '') + (job.exit !== null && job.exit !== undefined ? `, exit ${job.exit}` : '');
+    const p = job.progress || {};
+    const bar = $('job-bar');
+    bar.style.width = (p.pct !== null && p.pct !== undefined ? Math.min(100, p.pct) : 0) + '%';
+    $('job-detail').textContent = [p.phase, p.pct !== null && p.pct !== undefined ? p.pct + '%' : null,
+      p.detail, p.time_left ? p.time_left + ' left' : null].filter(Boolean).join(' · ');
+    // Cancel only where cancelling means anything: btrfs keeps relocating after a
+    // device remove is interrupted, so a button there would be a lie.
+    $('job-cancel').hidden = !(job.cancellable && job.state === 'running');
+    if (job.error) banner('fail', `${job.action}: ${job.error}`);
+  }
+
+  async function pollJob() {
+    if (!current) return;
+    try {
+      const job = await (await fetch(`/api/jobs/${current.id}`)).json();
+      renderJob(job);
+      const log = await (await fetch(`/api/jobs/${current.id}/log?offset=${current.offset}`)).json();
+      if (log.text) {
+        const pre = $('job-log');
+        const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+        pre.textContent += log.text;
+        current.offset = log.next;
+        if (stick) pre.scrollTop = pre.scrollHeight;
+      }
+      if (['queued', 'running'].includes(job.state)) setTimeout(pollJob, 2000);
+      else { poll(); current = null; }
+    } catch (e) {
+      setTimeout(pollJob, 5000);
+    }
+  }
+
+  async function loadJobs() {
+    try {
+      const d = await (await fetch('/api/jobs')).json();
+      const busy = (d.jobs || []).find((j) => ['queued', 'running'].includes(j.state));
+      const last = (d.jobs || [])[0];
+      for (const b of document.querySelectorAll('[data-action]')) b.disabled = !!busy || d.read_only;
+      $('actions-note').textContent = d.read_only ? 'this braidctl web is configured read_only'
+        : busy ? `a ${busy.action} job is running` : '';
+      if (busy) { current = current || { id: busy.id, offset: 0 }; pollJob(); }
+      else if (last) renderJob(last);
+    } catch (e) { /* the status poll reports the outage */ }
+  }
+
   let failures = 0;
   async function poll() {
     if (document.hidden) return;
@@ -153,7 +262,10 @@
     }
   }
 
+  wireActions();
   poll();
+  loadJobs();
   setInterval(poll, POLL_MS);
+  setInterval(() => { if (!current) loadJobs(); }, POLL_MS * 3);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 }());

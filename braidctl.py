@@ -79,6 +79,12 @@ DEFAULT_CONFIG = {
         # resident between visits. 0 stays up; ignored when run in the foreground.
         "idle_exit_sec": 900,
         "assets": "",
+        # Mutations run as transient systemd units, not inside a request: `remove` can
+        # take hours, and a request that waits for it is a wedged UI.
+        "jobs_dir": "/var/lib/braid/jobs",
+        "job_retention": 50,
+        "read_only": False,
+        "allow_mount_actions": True,
     },
     "notify": {
         # Borrow the SMTP block from an existing nas-monitor-style config
@@ -1477,6 +1483,24 @@ def cmd_web(cfg, args):
     return braidweb.serve(cfg, args, core=sys.modules[__name__])
 
 
+def cmd_web_job(cfg, args):
+    """Run one braidctl command on behalf of the web view, from inside a transient unit.
+
+    Started by `systemd-run`, so it is a child of pid 1: it survives the web process
+    being stopped, killed or idle-exited, it lands in the host mount namespace (a mount
+    made in a private one would be invisible to Samba), and it gets the same nice and
+    I/O priority as the timer units. What it runs is the plain CLI, so the argv in the
+    audit log is the argv a human would have typed."""
+    require_root()
+    here = Path(__file__).resolve().parent
+    for d in (here, Path("/usr/local/lib/braidctl")):
+        if (d / "braidweb.py").exists():
+            sys.path.insert(0, str(d))
+            break
+    import braidweb
+    return braidweb.run_job(cfg, args, core=sys.modules[__name__])
+
+
 def cmd_guard(cfg, args):
     """Unmount a pool that can no longer write, so writes fail loudly instead of vanishing.
 
@@ -1617,6 +1641,11 @@ def main(argv=None):
     s.add_argument("--url", action="store_true", help="print the URL with its token and exit")
     s.set_defaults(fn=cmd_web)
 
+    s = sub.add_parser("web-job", help=argparse.SUPPRESS)
+    s.add_argument("--id", required=True)
+    s.add_argument("argv", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_web_job)
+
     s = sub.add_parser("mount-degraded", help="mount with a drive missing")
     s.set_defaults(fn=cmd_mount_degraded)
 
@@ -1624,6 +1653,9 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s", stream=sys.stderr)
     cfg = load_config(args.config)
+    # Which config this run used, so a job started on behalf of the web view is
+    # given the same one rather than guessing at the default.
+    cfg["__path__"] = args.config
     try:
         args.fn(cfg, args)
     except BraidError as e:

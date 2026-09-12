@@ -57,3 +57,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   td { border: 0; padding: 2px 0; text-align: left; }
   td::before { content: attr(data-k) " "; color: var(--dim); }
 }
+
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line);
+         background: var(--card); color: var(--fg); cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--fg); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+      overflow: auto; max-height: 260px; margin: 8px 0; font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--fg);
+         max-width: min(560px, 92vw); padding: 18px; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog h2 { color: var(--fg); text-transform: none; letter-spacing: 0; font-size: 16px; }

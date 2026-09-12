@@ -27,7 +27,10 @@ import http.server
 import json
 import os
 import secrets
+import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -193,7 +196,7 @@ class PoolView:
                         "cmdline": holder["cmdline"] if holder else None}
         snap["config"] = {"debounce_sec": cfg["debounce_sec"], "warn_percent": cfg["warn_percent"],
                           "rebuild_margin": cfg["rebuild_margin"],
-                          "read_only": True, "mountpoint": cfg["mountpoint"]}
+                          "read_only": self.web["read_only"], "mountpoint": cfg["mountpoint"]}
         snap["smart_at"] = int(self.smart_at) if getattr(self, "smart_at", 0) else None
         return snap
 
@@ -237,6 +240,225 @@ class PoolView:
                 return dict(snap, source="snapshot", age_sec=age, error=self.error)
             except (OSError, ValueError):
                 return None
+
+
+# ---------------------------------------------------------------- jobs
+
+JOB_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{12}$")
+BRAIDCTL = "/usr/local/sbin/braidctl"
+
+
+def new_job_id():
+    return time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(6)
+
+
+class Jobs:
+    """One mutation at a time, started as a transient systemd unit, its output tee'd to a
+    file so the page can tail it with a seek instead of a journal cursor.
+
+    The record is written by the job itself, not by the web process: a five-hour remove
+    has to keep reporting progress while nobody is looking at the page."""
+
+    def __init__(self, cfg, core, log):
+        self.cfg, self.core, self.log = cfg, core, log
+        self.web = cfg["web"]
+        self.dir = Path(self.web["jobs_dir"])
+        self.dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        self.lock = threading.Lock()
+
+    # -- record io
+    def path(self, job_id):
+        if not JOB_ID_RE.match(job_id or ""):
+            raise ValueError("bad job id")
+        return self.dir / f"{job_id}.json"
+
+    def read(self, job_id):
+        try:
+            return json.loads(self.path(job_id).read_text())
+        except (OSError, ValueError):
+            return None
+
+    def write(self, job):
+        p = self.path(job["id"])
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(job, ensure_ascii=False, indent=1))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)          # a poll must never read half a record
+
+    def all(self):
+        out = []
+        for f in sorted(self.dir.glob("*.json"), reverse=True):
+            try:
+                out.append(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+        return out
+
+    def prune(self):
+        keep = self.web["job_retention"]
+        done = [j for j in self.all() if j.get("state") in ("done", "failed", "cancelled", "orphaned")]
+        for j in done[keep:]:
+            for suffix in (".json", ".log"):
+                try:
+                    (self.dir / (j["id"] + suffix)).unlink()
+                except OSError:
+                    pass
+
+    # -- lifecycle
+    def unfinished(self):
+        return [j for j in self.all() if j.get("state") in ("queued", "running")]
+
+    def reconcile(self, job):
+        """A record that says running while its unit is gone is not running. Say so
+        rather than showing a spinner forever; the log usually says what happened."""
+        if job.get("state") != "running":
+            return job
+        unit = job.get("unit")
+        if unit and shutil.which("systemctl"):
+            p = subprocess.run(["systemctl", "show", unit, "-p", "LoadState", "--value"],
+                               capture_output=True, text=True)
+            if p.stdout.strip() in ("not-found", ""):
+                job["state"] = "orphaned"
+                self.write(job)
+        return job
+
+    def start(self, action, argv, params, requested_by):
+        """Refuse rather than queue: two mutations at once is the thing the pool lock
+        exists to prevent, and a queue would just hide the wait."""
+        with self.lock:
+            busy = self.unfinished()
+            if busy:
+                raise Busy(f"job {busy[0]['id']} ({busy[0]['action']}) is still running", busy[0]["id"])
+            job_id = new_job_id()
+            job = {"version": 1, "id": job_id, "action": action, "params": params,
+                   "argv": [BRAIDCTL, "-c", self.cfg.get("__path__", "/etc/braid/braid.toml")] + argv,
+                   "unit": f"braid-job-{job_id}", "runner": "systemd",
+                   "created": int(time.time()), "started": None, "finished": None,
+                   "state": "queued", "exit": None, "error": None,
+                   "cancellable": action in ("scrub",),
+                   "requested_by": requested_by, "progress": None,
+                   "log": str(self.dir / f"{job_id}.log")}
+            self.write(job)
+            self.prune()
+            cmd = ["systemd-run", f"--unit={job['unit']}", "--collect", "--no-block",
+                   f"--description=braidctl {action} (web)",
+                   "-p", "TimeoutStartSec=infinity", "-p", "Nice=10",
+                   "-p", "IOSchedulingClass=best-effort", "-p", "IOSchedulingPriority=7",
+                   BRAIDCTL, "-c", self.cfg.get("__path__", "/etc/braid/braid.toml"),
+                   "web-job", "--id", job_id, "--"] + argv
+            self.log.warning("AUDIT job=%s addr=%s auth=%s action=%s argv=%s unit=%s",
+                             job_id, requested_by.get("addr"), requested_by.get("auth"),
+                             action, job["argv"], job["unit"])
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode != 0:
+                job.update(state="failed", finished=int(time.time()),
+                           error=(p.stderr or p.stdout).strip()[:500])
+                self.write(job)
+                raise Busy(f"could not start the job: {job['error']}", job_id)
+            return job
+
+    def cancel(self, job):
+        mnt = self.cfg["mountpoint"]
+        if job["action"] == "scrub":
+            subprocess.run(["btrfs", "scrub", "cancel", mnt], capture_output=True, text=True)
+            return True
+        return False
+
+
+class Busy(Exception):
+    def __init__(self, message, job_id=None):
+        super().__init__(message)
+        self.job_id = job_id
+
+
+def run_job(cfg, args, core):
+    """The wrapper that actually runs inside the transient unit (`braidctl web-job`)."""
+    jobs = Jobs(cfg, core, core.LOG)
+    argv = [a for a in (args.argv or []) if a != "--"]
+    job = jobs.read(args.id) or {"id": args.id, "action": argv[0] if argv else "?", "version": 1}
+    job.update(state="running", started=int(time.time()), pid=os.getpid())
+    jobs.write(job)
+    logfile = Path(job.get("log") or (jobs.dir / f"{args.id}.log"))
+    stop = threading.Event()
+
+    def sample():
+        pool = core.Pool(cfg)
+        baseline = None
+        while not stop.wait(5):
+            try:
+                prog = job_progress(core, cfg, pool, job, baseline)
+                if prog and prog.get("baseline"):
+                    baseline = prog["baseline"]
+                if prog:
+                    cur = jobs.read(args.id) or job
+                    cur["progress"] = prog
+                    jobs.write(cur)
+            except Exception:
+                pass                        # progress is a nicety; never fail the job for it
+    t = threading.Thread(target=sample, daemon=True)
+    t.start()
+
+    cmd = [BRAIDCTL, "-c", cfg.get("__path__", "/etc/braid/braid.toml")] + argv
+    code, err = 1, None
+    try:
+        with logfile.open("w") as f:
+            os.chmod(logfile, 0o600)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in p.stdout:
+                f.write(line)
+                f.flush()
+                print(line, end="", flush=True)     # and into the journal
+            code = p.wait()
+    except Exception as e:
+        err = str(e)
+    finally:
+        stop.set()
+        cur = jobs.read(args.id) or job
+        cur.update(state=("done" if code == 0 and not err else "failed"),
+                   finished=int(time.time()), exit=code, error=err)
+        jobs.write(cur)
+    return None if code == 0 else sys.exit(code)
+
+
+def job_progress(core, cfg, pool, job, baseline):
+    """What the page shows while a job runs. btrfs reports no progress for a device
+    remove at all, so derive it: `remove` relocates by balancing first (a percentage)
+    and then draining the departing device's allocation (bytes we can watch)."""
+    action = job.get("action")
+    if action == "scrub":
+        info = {}
+        for line in pool.scrub_status().splitlines():
+            m = re.match(r"\s*(Status|Bytes scrubbed|Time left|ETA|Rate):\s+(.*)", line)
+            if m:
+                info[m[1]] = m[2].strip()
+        m = re.search(r"\(([\d.]+)%\)", info.get("Bytes scrubbed", ""))
+        return {"phase": info.get("Status") or "scrubbing",
+                "pct": float(m[1]) if m else None,
+                "detail": " ".join(x for x in (info.get("Bytes scrubbed"), info.get("Rate")) if x),
+                "time_left": info.get("Time left"), "updated": int(time.time())}
+    bal = pool.balance_status()
+    if action in ("remove", "monitor") :
+        devid = (job.get("params") or {}).get("devid")
+        if bal["running"]:
+            return {"phase": "compacting", "pct": bal["pct"],
+                    "detail": bal.get("text") or "", "baseline": baseline,
+                    "updated": int(time.time())}
+        if devid:
+            alloc = pool.alloc_by_devid().get(int(devid))
+            if alloc:
+                base = baseline or {"alloc": alloc[1]}
+                left, start = alloc[1], max(1, base["alloc"])
+                pct = max(0.0, min(100.0, (1 - left / start) * 100))
+                prev = ((job.get("progress") or {}).get("pct")) or 0
+                return {"phase": "relocating", "pct": round(max(pct, prev), 1),
+                        "detail": f"{core.fmt_bytes(left)} still allocated on devid {devid} "
+                                  f"(of {core.fmt_bytes(start)}) — approximate",
+                        "baseline": base, "updated": int(time.time())}
+    if bal["running"]:
+        return {"phase": "balancing", "pct": bal["pct"], "detail": bal.get("text") or "",
+                "updated": int(time.time())}
+    return {"phase": action or "working", "pct": None, "detail": "", "updated": int(time.time())}
 
 
 # ---------------------------------------------------------------- http
@@ -364,6 +586,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(503, {"error": "no pool data yet", "hint": "sudo braidctl status"})
             return self.send_json(200, snap)
 
+        if path == "/api/jobs":
+            jobs = self.ctx["jobs"]
+            return self.send_json(200, {"jobs": [jobs.reconcile(j) for j in jobs.all()[:20]],
+                                        "read_only": self.ctx["cfg"]["web"]["read_only"],
+                                        "actions": sorted(self.ACTIONS)})
+        m = re.match(r"^/api/jobs/([^/]+)(/log)?$", path)
+        if m:
+            jobs = self.ctx["jobs"]
+            try:
+                job = jobs.read(m[1])
+            except ValueError:
+                return self.deny(400, "bad-job-id", "bad job id")
+            if not job:
+                return self.send_json(404, {"error": "no such job"})
+            if not m[2]:
+                return self.send_json(200, jobs.reconcile(job))
+            # Incremental tail by offset: a seek and a read, no journal cursors.
+            try:
+                offset = max(0, int(params.get("offset") or 0))
+            except ValueError:
+                offset = 0
+            try:
+                with open(job["log"], "r", errors="replace") as f:
+                    f.seek(offset)
+                    text = f.read(MAX_BODY * 8)
+                    return self.send_json(200, {"offset": offset, "next": f.tell(), "text": text,
+                                                "eof": job.get("state") not in ("queued", "running")})
+            except OSError:
+                return self.send_json(200, {"offset": offset, "next": offset, "text": "", "eof": False})
+
         if path in ASSETS:
             # The page in text, for curl and for a browser with no JS: the same output as
             # `braidctl status`, which is a useful answer rather than an apology.
@@ -377,9 +629,106 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         return self.send_json(404, {"error": "no such endpoint"})
 
+    # The whole mutation vocabulary. Validation is membership, not sanitising: a value
+    # that is not an element of a set we enumerated ourselves never reaches argv.
+    ACTIONS = {
+        "scrub":   {"argv": lambda p: ["scrub"], "label": "scrub"},
+        "monitor": {"argv": lambda p: ["monitor"], "label": "monitor pass"},
+    }
+
+    def mutation_allowed(self):
+        if self.ctx["cfg"]["web"]["read_only"]:
+            self.deny(403, "read-only", "this braidctl web is configured read_only")
+            return False
+        # SameSite=Strict is most of the defence, but cookies ignore port: anything else
+        # on localhost is same-site with us. A custom header cannot be set cross-origin
+        # without a preflight, and we answer none.
+        if self.headers.get("X-Braid-CSRF") != "1":
+            self.deny(403, "missing-csrf", "mutations require the X-Braid-CSRF: 1 header")
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            host = origin.split("//", 1)[-1].lower()
+            if host not in self.ctx["hosts"]:
+                self.deny(403, "bad-origin", "unexpected Origin")
+                return False
+        return True
+
+    def body_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > MAX_BODY or self.headers.get("Transfer-Encoding"):
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode())
+        except (ValueError, UnicodeDecodeError):
+            return None
+
     def do_POST(self):
-        # Read-only for now: mutations arrive with the job runner.
-        self.send_json(405, {"error": "this build serves GET only"})
+        path, _, _ = self.path.partition("?")
+        if not self.host_ok():
+            return self.deny(421, "bad-host", "unexpected Host header")
+        if not self.authorised():
+            return None
+        if not self.mutation_allowed():
+            return None
+
+        if path == "/api/jobs":
+            return self.start_job()
+        m = re.match(r"^/api/jobs/([^/]+)/cancel$", path)
+        if m:
+            return self.cancel_job(m[1])
+        return self.send_json(404, {"error": "no such endpoint"})
+
+    def start_job(self):
+        body = self.body_json() or {}
+        action = body.get("action")
+        spec = self.ACTIONS.get(action)
+        if not spec:
+            return self.deny(400, "bad-action", f"unknown action {action!r}")
+        # Pre-flight with the same predicates the CLI uses, so the common refusal arrives
+        # as an error with the real message instead of a job that dies two seconds later.
+        try:
+            core, cfg = self.ctx["core"], self.ctx["cfg"]
+            pool = core.Pool(cfg)
+            if action == "scrub":
+                if not pool.is_mounted():
+                    raise core.BraidError(f"{cfg['mountpoint']} is not mounted")
+                if "running" in pool.scrub_status():
+                    raise core.BraidError("a scrub is already running")
+                if pool.balance_running():
+                    raise core.BraidError("a balance is running (rebuild or rebalance); "
+                                          "scrub once it finishes")
+            holder = core.lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
+            if holder and action != "monitor":
+                raise core.BraidError(f"another braidctl is running: {holder['cmdline']}")
+        except Exception as e:
+            return self.deny(400, "preflight", str(e))
+        try:
+            job = self.ctx["jobs"].start(action, spec["argv"](body), {},
+                                         {"addr": self.client_address[0],
+                                          "auth": "cookie" if self.headers.get("Cookie") else "token",
+                                          "ua": (self.headers.get("User-Agent") or "")[:120]})
+        except Busy as e:
+            return self.send_json(409, {"error": str(e), "job": e.job_id})
+        return self.send_json(202, job)
+
+    def cancel_job(self, job_id):
+        jobs = self.ctx["jobs"]
+        try:
+            job = jobs.read(job_id)
+        except ValueError:
+            return self.deny(400, "bad-job-id", "bad job id")
+        if not job:
+            return self.send_json(404, {"error": "no such job"})
+        if not job.get("cancellable"):
+            return self.send_json(409, {"error": "this job cannot be cancelled: btrfs continues "
+                                                 "the work in the kernel even if the command stops"})
+        jobs.cancel(job)
+        self.ctx["log"].warning("AUDIT cancel job=%s addr=%s", job_id, self.client_address[0])
+        return self.send_json(200, {"ok": True})
 
     def do_OPTIONS(self):
         # No Access-Control-Allow-* header, ever. That is what makes a cross-origin
@@ -457,7 +806,8 @@ def serve(cfg, args, core):
     httpd = Server((host, port), Handler, bind_and_activate=False)
     httpd.ctx = {"cfg": cfg, "core": core, "log": log, "auth": auth, "view": view,
                  "assets": assets, "assetdir": str(assetdir), "hosts": hosts,
-                 "limiter": Limiter(), "last": time.time()}
+                 "limiter": Limiter(), "last": time.time(),
+                 "jobs": Jobs(cfg, core, log)}
     fd = systemd_socket()
     if fd is not None:
         httpd.socket = socket.socket(fileno=fd)

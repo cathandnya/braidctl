@@ -182,12 +182,28 @@ allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
 allow_from = ["100.64.0.2/32"]      # the laptop, and nothing else
 ```
 
-**Leave it on loopback** and reach it the way you already reach the machine —
-`ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a TLS proxy in front.
+**Put TLS in front.** braidctl speaks plain HTTP and always will — a certificate store is
+not something a storage tool should own. nginx, Caddy or `tailscale serve` terminating
+HTTPS is a perfectly good answer, including on a LAN, and then none of the cleartext
+caveats above apply:
 
-Whatever you pick, the token travels in cleartext over plain HTTP, and what it opens can
-add and remove drives. `allow_force_add` (the one irreversible operation) stays off unless
-you turn it on.
+```toml
+[web]
+listen = "127.0.0.1:8765"                  # the proxy is the only thing that reaches it
+allowed_hosts = ["nas.example.net"]        # the name the browser uses, as the proxy passes it
+cookie_secure = true                       # the session cookie is then HTTPS-only
+```
+
+Note that `allow_from` sees the proxy's address, not the browser's — this deliberately
+does not trust `X-Forwarded-For`, since a forwarded header is only worth what the hop in
+front of it is worth. Restrict clients at the proxy instead.
+
+**Leave it on loopback** and reach it the way you already reach the machine —
+`ssh -L 8765:127.0.0.1:8765 nas`.
+
+The token is a bearer credential: whoever has it can do whatever the UI can do, so it is
+worth keeping the path encrypted and the file at 0600. `allow_force_add` (the one
+irreversible operation) stays off unless you turn it on.
 
 From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
 the pool when it is down. Each button shows the exact command first, and the work runs as

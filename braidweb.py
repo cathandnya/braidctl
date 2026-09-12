@@ -982,10 +982,14 @@ def serve(cfg, args, core):
     # what the pool is exposed to is the operator's call, not this file's.
     loopback = host in ("127.0.0.1", "::1", "localhost")
     if not loopback:
-        log.warning("listening on %s, not loopback: the token travels in cleartext and "
-                    "opens a root-privileged UI. On a tailnet address WireGuard encrypts "
-                    "that and [web] allow_from can pin it to one device; on a LAN it is "
-                    "neither.", bind)
+        # This speaks plain HTTP and always will; TLS belongs to whatever is in front of
+        # it. So the thing to say is that the path has to be encrypted by something —
+        # a tailnet is, a reverse proxy can be, a LAN is not — not that the deployment
+        # is insecure, which this process cannot know.
+        log.warning("listening on %s, not loopback: this serves plain HTTP and the token "
+                    "is a bearer credential for a root-privileged UI. Make sure something "
+                    "encrypts the path — a tailnet does, a TLS proxy does (set "
+                    "[web] cookie_secure = true then), a LAN does not.", bind)
         if not web["allow_from"]:
             log.warning("[web] allow_from is empty: anything that can reach %s may try the "
                         "token. [web] read_only = true removes the mutating routes entirely.", bind)

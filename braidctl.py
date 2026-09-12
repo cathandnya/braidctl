@@ -85,6 +85,9 @@ DEFAULT_CONFIG = {
         "job_retention": 50,
         "read_only": False,
         "allow_mount_actions": True,
+        # `add --force` runs wipefs: the only irreversible operation in the tool, and the
+        # last thing standing between a typo and somebody else's disk. Off by default.
+        "allow_force_add": False,
     },
     "notify": {
         # Borrow the SMTP block from an existing nas-monitor-style config

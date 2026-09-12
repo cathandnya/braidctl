@@ -160,6 +160,16 @@ reach the machine — `ssh -L 8765:127.0.0.1:8765 nas`, `tailscale serve`, or a 
 — rather than binding it to the LAN: the token travels in cleartext, and what it opens
 can erase disks.
 
+From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
+the pool when it is down. Each button shows the exact command first, and the work runs as
+a transient systemd unit rather than inside the request, so a remove that takes hours
+survives the page being closed. Every refusal is the CLI's own: a drive the CLI would
+decline is listed with that reason and no button.
+
+`add --force` runs `wipefs` and is the one irreversible operation in the tool, so it is
+not reachable from a browser unless `[web] allow_force_add = true`, and even then only
+after typing back the drive's serial.
+
 **The pool does not depend on it.** Detection, re-protection and the boot mount are
 timers and udev rules that never call into it. It is socket-activated, so between visits
 no braidctl process is resident at all, and it exits again when left idle.

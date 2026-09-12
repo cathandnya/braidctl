@@ -115,6 +115,21 @@
       health.appendChild(el('span', 'dot ' + (dev.health_level || 'unknown')));
       health.appendChild(document.createTextNode(dev.health || '?'));
       tr.appendChild(health);
+
+      const act = el('td', null, null, '');
+      if (!dev.missing && !(d.config || {}).read_only) {
+        const r = (d.removable || {})[String(dev.devid)] || {};
+        const b = el('button', null, 'Remove');
+        b.disabled = r.ok !== true;
+        if (r.reason) b.title = r.reason;            // the CLI's own refusal, verbatim
+        b.addEventListener('click', () => askConfirm(
+          { action: 'remove', target: String(dev.devid) },
+          `braidctl remove ${dev.devid}`,
+          `${dev.name} ${dev.model || ''} ${bytes(dev.size)}. Data is relocated first, which can take hours, and it cannot be cancelled once started.`));
+        act.appendChild(b);
+        if (r.ok !== true && r.reason) act.appendChild(el('div', 'why', r.reason));
+      }
+      tr.appendChild(act);
       tb.appendChild(tr);
     }
 
@@ -128,6 +143,12 @@
       }
     } else {
       $('scrub').textContent = 'no scrub has run yet';
+    }
+
+    const unmounted = state === 'UNMOUNTED';
+    for (const a of ['mount', 'mount-degraded']) {
+      const b = document.querySelector(`[data-action="${a}"]`);
+      if (b) b.hidden = !unmounted;
     }
 
     $('source').textContent = d.source === 'live' ? 'live' : `${d.source}, ${duration(d.age_sec)} old`;
@@ -144,16 +165,18 @@
              note: 'Reads every block and checks it against its checksum. Takes hours and uses every drive at once.' },
     monitor: { cmd: 'braidctl monitor',
                note: 'One detection pass, the same one the five-minute timer runs.' },
+    mount: { cmd: 'braidctl mount', note: 'Mount the pool, waiting for drives to appear.' },
+    'mount-degraded': { cmd: 'braidctl mount-degraded',
+                        note: 'Mount with a drive missing. Writes go to fewer copies until it is re-protected.' },
   };
 
   let pending = null;
 
-  function askConfirm(action) {
-    const spec = COMMANDS[action];
-    pending = action;
-    $('confirm-title').textContent = spec.cmd;
-    $('confirm-cmd').textContent = 'sudo ' + spec.cmd;
-    $('confirm-note').textContent = spec.note;
+  function askConfirm(body, cmd, note) {
+    pending = body;
+    $('confirm-title').textContent = cmd;
+    $('confirm-cmd').textContent = 'sudo ' + cmd;
+    $('confirm-note').textContent = note || '';
     $('confirm').showModal();
   }
 
@@ -170,15 +193,25 @@
 
   function wireActions() {
     for (const b of document.querySelectorAll('[data-action]')) {
-      b.addEventListener('click', () => askConfirm(b.dataset.action));
+      b.addEventListener('click', () => {
+        const a = b.dataset.action;
+        const spec = COMMANDS[a] || { cmd: 'braidctl ' + a, note: '' };
+        askConfirm({ action: a }, spec.cmd, spec.note);
+      });
     }
+    $('show-candidates').addEventListener('click', () => {
+      const box = $('candidates');
+      box.hidden = !box.hidden;
+      if (!box.hidden) loadCandidates();
+    });
     $('confirm-no').addEventListener('click', () => { $('confirm').close(); pending = null; });
     $('confirm-yes').addEventListener('click', async () => {
       $('confirm').close();
       const action = pending;
       pending = null;
+      if (!action) return;
       try {
-        const job = await post('/api/jobs', { action });
+        const job = await post('/api/jobs', action);
         current = { id: job.id, offset: 0 };
         $('job-log').textContent = '';
         pollJob();
@@ -190,6 +223,43 @@
       if (!current) return;
       try { await post(`/api/jobs/${current.id}/cancel`); } catch (e) { banner('fail', e.message); }
     });
+  }
+
+  async function loadCandidates() {
+    const box = $('candidates');
+    clear(box);
+    let d;
+    try { d = await (await fetch('/api/devices/candidates')).json(); }
+    catch (e) { box.appendChild(el('p', 'dim', e.message)); return; }
+    for (const c of d.candidates || []) {
+      if (c.status === 'member') continue;
+      const row = el('div', 'cand');
+      const name = el('div', null, `${c.path} · ${c.model || '?'} · ${bytes(c.size)}`);
+      row.appendChild(name);
+      // Refused drives stay on screen with the reason braidctl gave. Hiding them sends
+      // the operator to a terminal with lsblk, which is where the wrong sdX gets typed.
+      row.appendChild(el('div', 'why', c.reason || ''));
+      if (c.status === 'ok') {
+        const b = el('button', null, 'Add');
+        b.addEventListener('click', () => askConfirm({ action: 'add', device: c.path },
+          `braidctl add ${c.path}`,
+          `${c.model || ''} ${bytes(c.size)}. A full balance starts afterwards; the pool stays usable.`));
+        row.appendChild(b);
+      } else if (c.status === 'needs_force') {
+        const b = el('button', null, 'Erase and add…');
+        b.addEventListener('click', () => {
+          const want = c.serial || `WIPE ${c.model} ${c.size}`;
+          const typed = window.prompt(`This ERASES ${c.path}. Type exactly:\n${want}`);
+          if (typed === null) return;
+          askConfirm({ action: 'add', device: c.path, confirm: typed, confirm_wipe: 'ERASE' },
+            `braidctl add --force ${c.path}`,
+            'wipefs runs first. Everything on that drive is gone, and this cannot be undone.');
+        });
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    }
+    if (!box.childElementCount) box.appendChild(el('p', 'dim', 'no drives outside the pool'));
   }
 
   // --- jobs ---------------------------------------------------------------

@@ -47,6 +47,13 @@ smart_ttl_sec = 900             # smartctl is slow and wakes sleeping drives
 btrfs_ttl_sec = 3
 idle_exit_sec = 900             # socket activation: exit when idle. 0 = stay up
 assets = ""                     # "" = next to braidctl, then /usr/local/share/braidctl/web
+read_only = false               # refuse every mutation at the dispatcher
+allow_mount_actions = true
+# `add --force` runs wipefs: the only irreversible operation in the tool. Off by default,
+# and even when on the UI requires the drive's serial typed back before it will run.
+allow_force_add = false
+jobs_dir = "/var/lib/braid/jobs"
+job_retention = 50
 
 [notify]
 # Any JSON file with a notification.email object of

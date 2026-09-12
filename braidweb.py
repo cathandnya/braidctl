@@ -336,7 +336,7 @@ class Jobs:
                    "unit": f"braid-job-{job_id}", "runner": "systemd",
                    "created": int(time.time()), "started": None, "finished": None,
                    "state": "queued", "exit": None, "error": None,
-                   "cancellable": action in ("scrub",),
+                   "cancellable": action == "scrub",
                    "requested_by": requested_by, "progress": None,
                    "log": str(self.dir / f"{job_id}.log")}
             self.write(job)
@@ -459,6 +459,47 @@ def job_progress(core, cfg, pool, job, baseline):
         return {"phase": "balancing", "pct": bal["pct"], "detail": bal.get("text") or "",
                 "updated": int(time.time())}
     return {"phase": action or "working", "pct": None, "detail": "", "updated": int(time.time())}
+
+
+def candidates(core, cfg, allow_force):
+    """Every whole disk on the machine, each carrying what `braidctl add` would say about it.
+
+    Refused drives are listed with their reason rather than hidden: hiding them sends the
+    operator to a terminal with `lsblk` to find out why, and a terminal with lsblk and an
+    impatient human is where the wrong /dev/sdX gets typed."""
+    pool = core.Pool(cfg)
+    members = {d.path for d in pool.devices()} if pool.is_mounted() else set()
+    out = []
+    for node in core.lsblk():
+        if node.get("type") != "disk":
+            continue
+        path = node["path"]
+        entry = {"path": path, "model": node.get("model") or "", "serial": node.get("serial") or "",
+                 "size": node.get("size"), "tran": node.get("tran") or "",
+                 "fstype": node.get("fstype") or "",
+                 "children": [c["path"] for c in core.flatten_lsblk(node.get("children", []))],
+                 "member": path in members}
+        if entry["member"]:
+            entry["status"], entry["reason"] = "member", "already a member of this pool"
+            out.append(entry)
+            continue
+        try:
+            core.check_addable(cfg, pool, path, False)
+            entry["status"], entry["reason"] = "ok", ""
+        except core.BraidError as e:
+            reason = str(e)
+            # "already holds data … Pass --force to erase it" is the only refusal --force
+            # lifts; everything else (system disk, mounted, holders, protected_devices)
+            # stands whatever the flags say, and the UI must not suggest otherwise.
+            if "Pass --force" in reason:
+                entry["status"] = "needs_force" if allow_force else "has_data"
+            else:
+                entry["status"] = "refused"
+            entry["reason"] = reason
+        except Exception as e:
+            entry["status"], entry["reason"] = "unknown", str(e)
+        out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------- http
@@ -586,6 +627,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(503, {"error": "no pool data yet", "hint": "sudo braidctl status"})
             return self.send_json(200, snap)
 
+        if path == "/api/devices/candidates":
+            core, cfg = self.ctx["core"], self.ctx["cfg"]
+            allow = bool(cfg["web"].get("allow_force_add"))
+            return self.send_json(200, {"candidates": candidates(core, cfg, allow),
+                                        "allow_force_add": allow})
+
         if path == "/api/jobs":
             jobs = self.ctx["jobs"]
             return self.send_json(200, {"jobs": [jobs.reconcile(j) for j in jobs.all()[:20]],
@@ -632,9 +679,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # The whole mutation vocabulary. Validation is membership, not sanitising: a value
     # that is not an element of a set we enumerated ourselves never reaches argv.
     ACTIONS = {
-        "scrub":   {"argv": lambda p: ["scrub"], "label": "scrub"},
-        "monitor": {"argv": lambda p: ["monitor"], "label": "monitor pass"},
+        "scrub":          {"label": "scrub"},
+        "monitor":        {"label": "monitor pass"},
+        "add":            {"label": "add a drive"},
+        "remove":         {"label": "remove a drive"},
+        "mount":          {"label": "mount", "gate": "allow_mount_actions"},
+        "mount-degraded": {"label": "mount degraded", "gate": "allow_mount_actions"},
     }
+
+    def build_argv(self, action, body):
+        """Validation is membership in a set we enumerated ourselves, never sanitising.
+        `/dev/sda; rm -rf /` is not an element of any of these sets, so it cannot reach
+        argv — a stronger property than any amount of quoting, and easier to review."""
+        core, cfg = self.ctx["core"], self.ctx["cfg"]
+        if action in ("scrub", "monitor", "mount", "mount-degraded"):
+            return [action], {}
+        pool = core.Pool(cfg)
+        if action == "remove":
+            target = str(body.get("target") or "")
+            if target == "missing":
+                return ["remove", "missing"], {"target": "missing"}
+            devs = {str(d.devid): d for d in pool.devices()}
+            d = devs.get(target)
+            if d is None:
+                raise ValueError(f"devid {target!r} is not a member of this pool right now")
+            # str(int) we produced, not the client's string
+            return ["remove", str(d.devid)], {"devid": d.devid, "name": d.name,
+                                              "model": d.model, "size": d.size}
+        if action == "add":
+            want = os.path.realpath(str(body.get("device") or ""))
+            allow_force = bool(cfg["web"].get("allow_force_add"))
+            for c in candidates(core, cfg, allow_force):
+                if os.path.realpath(c["path"]) != want:
+                    continue
+                if c["status"] == "ok":
+                    return ["add", c["path"]], {"device": c["path"], "model": c["model"],
+                                                "serial": c["serial"], "size": c["size"]}
+                if c["status"] == "needs_force":
+                    self.check_wipe_confirmation(c, body)
+                    return ["add", "--force", c["path"]], {"device": c["path"], "model": c["model"],
+                                                           "serial": c["serial"], "size": c["size"],
+                                                           "force": True}
+                raise ValueError(c["reason"])
+            raise ValueError("no such addable device")
+        raise ValueError(f"unknown action {action!r}")
+
+    def check_wipe_confirmation(self, cand, body):
+        """`add --force` runs wipefs. It is the only irreversible thing in the tool, so it
+        is off unless braid.toml says otherwise, and even then the operator has to type
+        back what the server just read from the drive."""
+        want = cand["serial"] or f"WIPE {cand['model']} {cand['size']}"
+        given = str(body.get("confirm") or "")
+        if not hmac.compare_digest(given, want):
+            raise ValueError(f"to erase {cand['path']} you must confirm with exactly: {want}")
+        if str(body.get("confirm_wipe") or "") != "ERASE":
+            raise ValueError('also send confirm_wipe: "ERASE"')
 
     def mutation_allowed(self):
         if self.ctx["cfg"]["web"]["read_only"]:
@@ -688,6 +787,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         spec = self.ACTIONS.get(action)
         if not spec:
             return self.deny(400, "bad-action", f"unknown action {action!r}")
+        gate = spec.get("gate")
+        if gate and not self.ctx["cfg"]["web"].get(gate):
+            return self.deny(403, "gated", f"{action} is disabled in braid.toml ([web] {gate})")
+        try:
+            argv, params = self.build_argv(action, body)
+        except ValueError as e:
+            return self.deny(400, "bad-params", str(e))
+        except Exception as e:
+            return self.deny(400, "bad-params", str(e))
         # Pre-flight with the same predicates the CLI uses, so the common refusal arrives
         # as an error with the real message instead of a job that dies two seconds later.
         try:
@@ -701,13 +809,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if pool.balance_running():
                     raise core.BraidError("a balance is running (rebuild or rebalance); "
                                           "scrub once it finishes")
+            if action in ("add", "remove"):
+                if not pool.is_mounted():
+                    raise core.BraidError(f"{cfg['mountpoint']} is not mounted")
+                if pool.balance_running():
+                    raise core.BraidError("a balance is running; try again once it finishes")
+            if action == "remove":
+                report = core.collect(pool, smart=False)
+                target = str(body.get("target") or "")
+                losing = report.gone if target == "missing" else [d for d in report.devs
+                                                                 if str(d.devid) == target]
+                if losing:
+                    ok, after, needed = core.can_rebuild(report, cfg, losing=losing)
+                    if not ok:
+                        raise core.BraidError(
+                            f"removing that would not leave room for the data (usable afterwards "
+                            f"{core.fmt_bytes(after)} < used {core.fmt_bytes(needed)})")
             holder = core.lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
             if holder and action != "monitor":
                 raise core.BraidError(f"another braidctl is running: {holder['cmdline']}")
         except Exception as e:
             return self.deny(400, "preflight", str(e))
         try:
-            job = self.ctx["jobs"].start(action, spec["argv"](body), {},
+            job = self.ctx["jobs"].start(action, argv, params,
                                          {"addr": self.client_address[0],
                                           "auth": "cookie" if self.headers.get("Cookie") else "token",
                                           "ua": (self.headers.get("User-Agent") or "")[:120]})

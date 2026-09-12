@@ -39,8 +39,33 @@ sudo braidctl web --url                        # the URL, with its token
 ssh -L 8765:127.0.0.1:8765 nas                 # how to reach it from a laptop or phone
 ```
 
-It shows what `braidctl status` shows. It is read-only in this version: there is no route
-that changes the pool, and POST is refused outright.
+It shows what `braidctl status` shows, and runs what you would otherwise type: scrub, a
+monitor pass, add, remove, and mount / mount-degraded when the pool is down. Every button
+opens one dialog naming the exact command, because that is the point — it runs
+`braidctl remove 4`, which you could have typed yourself.
+
+Nothing runs inside a request. Each action starts a transient systemd unit
+(`braid-job-<id>`) owned by pid 1, so a remove that takes hours survives the page being
+closed, the server being stopped, or the session idling out. Progress and the log come
+back through `/var/lib/braid/jobs/<id>.{json,log}`; `journalctl -u 'braid-job-*'` has the
+same output.
+
+Refusals come from the CLI's own interlocks, so the UI cannot offer what the CLI would
+decline: a drive that is the system disk, mounted, held by LUKS/LVM, matching
+`protected_devices`, or already a member is listed with that reason and no button. A
+remove that would not leave room for the data is shown disabled with the shortfall.
+
+`add --force` — the one irreversible operation, since it runs `wipefs` — is not reachable
+from the browser unless `[web] allow_force_add = true`, and even then it asks you to type
+back the drive's serial (or model and size) before it will run. The recommended way to
+admit a used disk is still a terminal:
+
+```bash
+sudo braidctl add --force /dev/sdX     # while looking at lsblk
+```
+
+To take the whole thing away, `read_only = true` refuses every mutation at the
+dispatcher, and `allow_mount_actions = false` drops the mount buttons.
 
 The token lives in `/etc/braid/web-token` (0600, created on first start). Rotating it is
 `rm` plus a restart, which invalidates every open session:

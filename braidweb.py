@@ -378,20 +378,38 @@ def run_job(cfg, args, core):
     argv = [a for a in (args.argv or []) if a != "--"]
     job = jobs.read(args.id) or {"id": args.id, "action": argv[0] if argv else "?", "version": 1}
     job.update(state="running", started=int(time.time()), pid=os.getpid())
+    # The baseline has to be taken before the command starts. Sampling it later means
+    # measuring against a device that has already been partly drained, and a bar that
+    # starts at zero when the work is half done is worse than no bar.
+    baseline_alloc = None
+    devid = (job.get("params") or {}).get("devid")
+    if devid:
+        try:
+            alloc = core.Pool(cfg).alloc_by_devid().get(int(devid))
+            if alloc:
+                baseline_alloc = {"alloc": alloc[1]}
+        except Exception:
+            pass
     jobs.write(job)
     logfile = Path(job.get("log") or (jobs.dir / f"{args.id}.log"))
     stop = threading.Event()
 
     def sample():
         pool = core.Pool(cfg)
-        baseline = None
-        while not stop.wait(5):
+        baseline = baseline_alloc
+        first = True
+        while first or not stop.wait(5):
+            first = False
             try:
+                if stop.is_set():
+                    return
                 prog = job_progress(core, cfg, pool, job, baseline)
                 if prog and prog.get("baseline"):
                     baseline = prog["baseline"]
                 if prog:
                     cur = jobs.read(args.id) or job
+                    if cur.get("state") not in ("queued", "running"):
+                        return              # finished while we were sampling
                     cur["progress"] = prog
                     jobs.write(cur)
             except Exception:
@@ -415,8 +433,14 @@ def run_job(cfg, args, core):
     finally:
         stop.set()
         cur = jobs.read(args.id) or job
-        cur.update(state=("done" if code == 0 and not err else "failed"),
-                   finished=int(time.time()), exit=code, error=err)
+        ok = code == 0 and not err
+        # Leaving the last sample on a finished job shows a bar stuck at whatever it
+        # happened to read a few seconds before the end.
+        cur.update(state=("done" if ok else "failed"),
+                   finished=int(time.time()), exit=code, error=err,
+                   progress={"phase": "finished" if ok else "failed",
+                             "pct": 100 if ok else None, "detail": "",
+                             "updated": int(time.time())})
         jobs.write(cur)
     return None if code == 0 else sys.exit(code)
 
@@ -471,7 +495,10 @@ def candidates(core, cfg, allow_force):
     members = {d.path for d in pool.devices()} if pool.is_mounted() else set()
     out = []
     for node in core.lsblk():
-        if node.get("type") != "disk":
+        # Whole disks, plus loop devices so the loop testbed can exercise this path.
+        # Partitions are left out on purpose: the CLI will take one, but listing every
+        # partition on the machine turns the picker into noise, which is its own hazard.
+        if node.get("type") not in ("disk", "loop"):
             continue
         path = node["path"]
         entry = {"path": path, "model": node.get("model") or "", "serial": node.get("serial") or "",
@@ -728,7 +755,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """`add --force` runs wipefs. It is the only irreversible thing in the tool, so it
         is off unless braid.toml says otherwise, and even then the operator has to type
         back what the server just read from the drive."""
-        want = cand["serial"] or f"WIPE {cand['model']} {cand['size']}"
+        # A drive behind a USB bridge often reports no serial, and a loop device reports
+        # neither, so fall back to something the operator can actually read off the page.
+        want = cand["serial"] or f"WIPE {cand['model'] or os.path.basename(cand['path'])} {cand['size']}"
         given = str(body.get("confirm") or "")
         if not hmac.compare_digest(given, want):
             raise ValueError(f"to erase {cand['path']} you must confirm with exactly: {want}")

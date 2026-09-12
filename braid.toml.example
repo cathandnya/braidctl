@@ -42,8 +42,13 @@ allowed_hosts = []              # extra Host: values to accept, e.g. a reverse p
 # X-Forwarded-For is deliberately not trusted, so restrict clients at the proxy instead.
 #   allow_from = ["100.106.216.14/32"]
 allow_from = []
-# 0600, created on first start. There is deliberately no `token = ` key: this file is
-# world-readable and ends up quoted in bug reports.
+# "token" or "none". A token assumes nothing about what is in front of this. Where the
+# network already answers the question — a tailnet pinned to one machine, a proxy that
+# authenticates, a host those clients can ssh into anyway — it adds a step and no
+# protection. Your call; cross-origin and Host checks apply either way.
+auth = "token"
+# 0600, created on first start when auth = "token". There is deliberately no `token = `
+# key: this file is world-readable and ends up quoted in bug reports.
 token_file = "/etc/braid/web-token"
 session_ttl_sec = 604800
 cookie_secure = false           # true if you terminate TLS in front of it

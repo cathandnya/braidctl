@@ -617,6 +617,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         must never be refused because something else from this address guessed wrong.
         The limiter exists to keep the journal readable, not to defend 256 bits."""
         auth = self.ctx["auth"]
+        if auth is None:                     # [web] auth = "none"
+            return True
         header = self.headers.get("X-Braid-Token") or ""
         bearer = (self.headers.get("Authorization") or "")
         if bearer.startswith("Bearer "):
@@ -683,7 +685,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # A token in the query string is exchanged once for a cookie, so the secret
         # leaves the address bar, the history and any future Referer.
-        if path == "/" and params.get("token"):
+        if path == "/" and params.get("token") and self.ctx["auth"]:
             if not self.ctx["auth"].check_token(params["token"]):
                 self.ctx["limiter"].fail(self.client_address[0])
                 return self.deny(401, "bad-token", "unauthorised")
@@ -987,11 +989,23 @@ def serve(cfg, args, core):
     web = cfg["web"]
     bind = getattr(args, "listen", None) or web["listen"]
     host, port = parse_bind(bind)
-    auth = Auth(web["token_file"], web["session_ttl_sec"])
+    if web["auth"] not in ("token", "none"):
+        raise core.BraidError(f'[web] auth must be "token" or "none", not {web["auth"]!r}')
+    auth = Auth(web["token_file"], web["session_ttl_sec"]) if web["auth"] == "token" else None
 
     if getattr(args, "url", False):
-        print(f"http://{host if ':' not in host else '[' + host + ']'}:{port}/?token={auth.token}")
+        shown = host if ":" not in host else f"[{host}]"
+        print(f"http://{shown}:{port}/" + (f"?token={auth.token}" if auth else ""))
         return None
+
+    if auth is None:
+        # Said at every start, because a missing credential is invisible from outside in
+        # a way a bind address is not. Whether it is missing for a good reason — a
+        # network in front that already authenticates, a machine that can ssh in anyway
+        # — is not something this process can judge.
+        log.warning("[web] auth = none: anything that reaches %s can drive this UI, "
+                    "including adding and removing drives. Cross-origin requests and "
+                    "unexpected Host headers are still refused.", bind)
 
     # The default is loopback and the README says why. Someone who writes a different
     # listen address has already said what they want, and a second flag to confirm it

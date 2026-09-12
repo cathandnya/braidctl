@@ -66,6 +66,12 @@ DEFAULT_CONFIG = {
         # shapes that make sense (LAN plus read_only, tailnet plus allow_from).
         "listen": "127.0.0.1:8765",
         "allowed_hosts": [],
+        # "token" or "none". A token is the default because it assumes nothing about
+        # what is in front. Where the network already answers the question — a tailnet
+        # pinned to one machine, a proxy that authenticates, a host whose users can ssh
+        # in anyway — a token adds a step and no protection, and that is the operator's
+        # call to make. Cross-origin and Host checks apply either way.
+        "auth": "token",
         # Source addresses allowed to connect at all, as addresses or CIDRs. Empty means
         # anything that can reach the socket. Worth setting whenever the socket is not on
         # loopback: on a tailnet an address cannot be claimed without that peer's key.

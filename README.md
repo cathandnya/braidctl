@@ -163,7 +163,13 @@ braidctl gives you the settings and stays out of the decision.
 What is worth knowing before putting it anywhere:
 
 - the token is a bearer credential. Whoever holds it can do whatever the UI can do, which
-  includes adding and removing drives. It lives in a 0600 file and is never logged
+  includes adding and removing drives. It lives in a 0600 file and is never logged. After
+  the first visit a browser holds a signed cookie instead, so from then on the credential
+  is as well protected as that browser's cookie store
+- `auth = "none"` turns it off. That is the right answer whenever the network in front
+  already answers the same question — a tailnet pinned to one machine, a proxy that
+  authenticates, a host whose clients can ssh in anyway — where a token adds a step and
+  no protection. Cross-origin and Host checks apply either way
 - `read_only = true` refuses every mutating route at the dispatcher
 - `allow_force_add` — `wipefs`, the one irreversible operation — is off unless you turn it on
 - `allowed_hosts` is a Host-header allowlist (DNS rebinding); any name a browser uses has
@@ -181,11 +187,12 @@ listen = "127.0.0.1:8765"
 allowed_hosts = ["nas.example.net"]     # the name the browser uses, as the proxy passes it
 cookie_secure = true
 
-# on a tailnet, one machine only
+# on a tailnet, one machine only, which already authenticates it
 [web]
 listen = "100.64.0.1:8765"              # this host's tailnet address
 allowed_hosts = ["100.64.0.1:8765", "nas.tailnet-name.ts.net:8765"]
 allow_from = ["100.64.0.2/32"]
+auth = "none"
 
 # on a LAN, nothing to break
 [web]

@@ -82,6 +82,57 @@ echo '- - -' | sudo tee /sys/class/scsi_host/hostN/scan   # bring it back (hostN
 readlink -f /sys/block/sdX/device                         # find hostN before you delete it
 ```
 
+### The web UI
+
+`contrib/loop-testbed.sh up` now writes a `[web]` block into the test config, so the UI
+can be pointed at the loop pool instead of the real one. Run it in the foreground:
+
+```bash
+T=/var/tmp/braidctl-test; C="-c $T/test.toml"; U=http://127.0.0.1:8765
+sudo braidctl $C web --listen 127.0.0.1:8765 &
+TOK=$(sudo cat $T/web-token)
+```
+
+Compare every number on the page against `sudo braidctl $C status` — usable, used, free,
+percentage, each drive's size, alloc and errors, and the verdict sentence word for word.
+Then the refusals, which are the part worth testing:
+
+```bash
+curl -so /dev/null -w '%{http_code}\n' $U/api/status                        # 401
+curl -so /dev/null -w '%{http_code}\n' -H 'Host: evil.example:8765' \
+     -H "X-Braid-Token: $TOK" $U/api/status                                 # 421, DNS rebinding
+curl -si -X OPTIONS $U/api/jobs | grep -i access-control                    # nothing: no CORS
+curl -so /dev/null -w '%{http_code}\n' -X POST -H "X-Braid-Token: $TOK" \
+     -d '{"action":"monitor"}' $U/api/jobs                                  # 403, no CSRF header
+for i in $(seq 12); do curl -so /dev/null -H 'X-Braid-Token: wrong' $U/api/status; done
+curl -si -H 'X-Braid-Token: wrong' $U/api/status | head -1                   # 429 + Retry-After
+curl -so /dev/null -w '%{http_code}\n' -H "X-Braid-Token: $TOK" $U/api/status  # 200 anyway
+```
+
+That last line is the one people get wrong: a valid token must never be refused because
+something else from the same address guessed wrong.
+
+The argv table, which is what stands between a browser and a mistyped device:
+
+```bash
+post() { curl -s -X POST -H "X-Braid-Token: $TOK" -H 'X-Braid-CSRF: 1' -d "$1" $U/api/jobs; }
+post '{"action":"remove","target":"999"}'                  # not a member of this pool
+post '{"action":"add","device":"/dev/sda; rm -rf /"}'      # no such addable device
+post '{"action":"add","device":"<the system disk>"}'       # it is the system disk
+curl -s -H "X-Braid-Token: $TOK" $U/api/jobs | jq '.jobs | length'   # unchanged: nothing started
+```
+
+`protected_devices` matches `/dev/disk/by-id` names, and loop devices have none, so that
+one has to be checked against a real disk or a hand-made by-id symlink — it is not covered
+by a loop run.
+
+Then a real job. `monitor` finishes in seconds and is the cheapest way to exercise the
+whole path: `POST {"action":"monitor"}`, then watch `/api/jobs/<id>` go queued -> running
+-> done, `/api/jobs/<id>/log?offset=N` stream the same text the journal has, and
+`systemctl is-active braid-job-<id>` reach inactive as `--collect` reaps it. Kill the web
+process mid-job and confirm the unit keeps running and the record keeps being updated:
+that is the proof the job lives in the transient unit and not in the server.
+
 ## Results
 
 Recorded on the development machine: Ubuntu 26.04, Linux 7.0, btrfs-progs 6.17.1, four USB drives of

@@ -36,7 +36,17 @@ label = "$LABEL"
 debounce_sec = 5
 samba_units = []
 state_file = "$DIR/state.json"
+# Without this a test run overwrites the real /var/lib/braid/status.json, which is what
+# a dashboard and the web view read (and what the web view seeds SMART from).
+status_file = "$DIR/status.json"
 smart_args = []
+
+[web]
+listen = "127.0.0.1:8765"
+token_file = "$DIR/web-token"
+jobs_dir = "$DIR/jobs"
+smart_ttl_sec = 30
+idle_exit_sec = 0
 [notify]
 config_file = "$DIR/no-such-file.json"
 EOF

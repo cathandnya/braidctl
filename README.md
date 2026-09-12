@@ -131,6 +131,7 @@ sudo braidctl remove /dev/sdg     # by path
 sudo braidctl remove missing      # evict a dead drive by hand (what monitor does for you)
 sudo braidctl monitor             # one detection pass; run from the timer every 5 minutes
 sudo braidctl scrub               # verify every block against its checksum
+sudo braidctl scrub --ack         # record the last result as reviewed (refused for real damage)
 sudo braidctl mount               # mount the pool (--wait N to retry while drives appear)
 sudo braidctl mount-degraded      # mount with a drive missing, by hand
 ```
@@ -143,6 +144,28 @@ Notifications go out by email. By default `braidctl` borrows the SMTP block from
 nas-monitor-style config; point `notify.config_file` at any JSON
 file with a `notification.email` object of `{smtp_server, smtp_port, username, password, from, to,
 use_tls}`. Without one, everything still lands in the journal — `journalctl -u braid-monitor`.
+
+## Reading a scrub result
+
+btrfs counts scrub errors by class, and the classes are not equally serious. `braidctl status` says
+which it was, because the difference decides whether you have lost data or lost an afternoon:
+
+| Counter | Meaning | braidctl |
+|---|---|---|
+| `csum`, `read`, `super` | a block could not be read, or did not match its checksum | **fail** — real damage, named per drive. `corrected > 0` with nothing uncorrectable is a **warn**: the mirror repaired it, but a drive handed back bad data |
+| `verify` only, device error counters clean | a tree block's header was not what the extent tree expected | **warn — look at it once.** Metadata damage looks like this, and so does a block that was freed and reused while the scrub was still reading it, which is ordinary under heavy write |
+| `verify` plus device I/O errors | as above, but the drives agree something went wrong | **fail** |
+
+A `verify`-only result on a busy pool is a question, not a verdict. Re-scrub while the pool is idle
+to settle it; if you have already checked the data and found it sound, record that:
+
+```bash
+sudo braidctl scrub --ack
+```
+
+The acknowledgement is bound to that scrub run and that result, so the next scrub reporting anything
+different raises it again. Real damage (`csum`/`read`/`super`) cannot be acknowledged away — the
+command refuses. Nothing is deleted either way: `btrfs scrub status` keeps its own record.
 
 ## Safety
 

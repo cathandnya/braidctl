@@ -121,11 +121,43 @@ by default.
 
 ```bash
 sudo braidctl scrub               # run one now (blocks until finished)
-sudo btrfs scrub status /srv/pool
+sudo btrfs scrub status -R /srv/pool     # the per-class counters braidctl judges on
+sudo btrfs scrub status -R -d /srv/pool  # ... per device
 ```
 
 Run one after any event that interrupted writes — a power loss, an unplanned removal, a drive that
 came back.
+
+`braidctl status` prints a last-scrub line with its reading of the result. `csum`, `read` or `super`
+errors are damage. A `verify`-only result with clean device counters is not, by itself, evidence of
+damage: a block freed and reused while the scrub was reading it produces exactly the same counter,
+and that is ordinary on a pool taking a large backup. It is reported as a warning that asks for one
+human look, not as a failure.
+
+To settle one, re-scrub when the pool is idle. To check a specific block the kernel named, the
+journal gives you the file:
+
+```
+BTRFS warning (device sda): scrub: header error at logical ... root 5 inode 2584 ... (path: timemachine/...)
+```
+
+Read that file back — btrfs verifies every block it returns, so a clean read of both copies is
+proof the data is sound. btrfs picks the mirror by PID parity, so read it more than once:
+
+```bash
+sync && echo 1 | sudo tee /proc/sys/vm/drop_caches
+sudo dd if=/srv/pool/<the path> of=/dev/null bs=1M     # repeat; different PIDs hit different mirrors
+sudo btrfs device stats /srv/pool                      # must stay at zero
+```
+
+If it reads clean, record that instead of leaving the pool amber until the next monthly scrub:
+
+```bash
+sudo braidctl scrub --ack
+```
+
+The acknowledgement names that scrub run and that result; a later scrub reporting anything different
+raises it again. `braidctl scrub --ack` refuses when the result is real damage.
 
 ## Replacing the whole pool's configuration
 

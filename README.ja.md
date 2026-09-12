@@ -129,6 +129,7 @@ sudo braidctl remove /dev/sdg     # パス指定でも可
 sudo braidctl remove missing      # 死んだドライブを手で外す (monitor が自動でやるのと同じ)
 sudo braidctl monitor             # 検知を 1 回。timer から 5 分毎に呼ばれる
 sudo braidctl scrub               # 全ブロックをチェックサムと照合
+sudo braidctl scrub --ack         # 直近の結果を確認済みとして記録 (本物の破損には使えない)
 sudo braidctl mount               # プールをマウント (--wait N でドライブ出現を待つ)
 sudo braidctl mount-degraded      # 1 台欠けた状態で手動マウント
 ```
@@ -141,6 +142,28 @@ nas-monitor 形式の既存設定から SMTP ブロックを借りる。
 `notification.email` に `{smtp_server, smtp_port, username, password, from, to, use_tls}` を持つ
 JSON なら何でも `notify.config_file` に指定できる。設定が無くても全部ジャーナルには残る —
 `journalctl -u braid-monitor`。
+
+## scrub の結果の読み方
+
+btrfs は scrub のエラーを種類別に数えていて、種類によって深刻さが違う。`braidctl status` はどちら
+だったかを言う。データを失ったのか、午後を失っただけなのかが、そこで決まるから。
+
+| カウンタ | 意味 | braidctl の判定 |
+|---|---|---|
+| `csum` / `read` / `super` | 読めなかった、またはチェックサムと一致しなかった | **fail** — 本物の破損。どのドライブかも出す。`corrected > 0` で uncorrectable が 0 なら **warn**（ミラーが直したが、ドライブは壊れたデータを返した） |
+| `verify` のみ、デバイスのエラーカウンタは 0 | ツリーブロックのヘッダが、エクステントツリーの言う内容と違った | **warn — 一度見ること。** メタデータの破損もこの形だが、scrub が読んでいる最中に解放されて再利用されたブロックも同じ形になる。書き込みが重いときには普通に起きる |
+| `verify` + デバイスの I/O エラー | 上と同じだが、ドライブ側も異常を報告している | **fail** |
+
+書き込み中のプールで `verify` だけが出たなら、それは判決ではなく質問。決着させるにはプールが
+静かなときに scrub をやり直す。既にデータを確認して問題が無かったなら、それを記録する:
+
+```bash
+sudo braidctl scrub --ack
+```
+
+確認済みの記録は「その scrub 実行」と「その結果」に紐付く。次の scrub が違うことを言えば、また
+鳴る。本物の破損 (`csum`/`read`/`super`) は確認済みにできない（コマンドが断る）。どちらにしても
+消すものは何も無く、`btrfs scrub status` の記録はそのまま残る。
 
 ## 安全装置
 

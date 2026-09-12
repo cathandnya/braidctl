@@ -152,7 +152,7 @@ class State:
     def __init__(self, path):
         self.path = Path(path)
         self.data = {"missing": {}, "err_base": {}, "last_notify": {}, "inventory": {},
-                     "rebuild": None, "smart_base": {}}
+                     "rebuild": None, "smart_base": {}, "scrub_ack": None}
         self._lock_fh = None
 
     def lock(self, quiet=False):
@@ -400,8 +400,13 @@ class Pool:
         p = run(["btrfs", "balance", "status", self.mnt], check=False)
         return "running" in p.stdout or "paused" in p.stdout
 
-    def scrub_status(self):
-        p = run(["btrfs", "scrub", "status", self.mnt], check=False)
+    def scrub_status(self, raw=False, per_device=False):
+        argv = ["btrfs", "scrub", "status"]
+        if raw:
+            argv.append("-R")          # exact counters per class instead of a summary line
+        if per_device:
+            argv.append("-d")
+        p = run(argv + [self.mnt], check=False)
         return p.stdout
 
     def smart(self, dev):
@@ -584,7 +589,7 @@ def verdict(report, cfg):
                     + ". Consider adding a drive")
 
 
-def render_status(report, cfg, state=None):
+def render_status(report, cfg, state=None, scrub=None):
     u = report.usage
     lines = []
     label = report.state_label()
@@ -614,6 +619,9 @@ def render_status(report, cfg, state=None):
         lines.append(f"Warning: {pct:.0f}% full. Rebuilds (balance) fail when free space runs short")
     if report.balance_running:
         lines.append("Balance in progress; performance is reduced until it finishes")
+    if scrub and scrub.get("started"):
+        when = time.strftime("%Y-%m-%d", time.localtime(scrub["started"]))
+        lines.append(f"Last scrub {when} ({scrub.get('status') or '?'}): {scrub['text']}")
     return "\n".join(lines)
 
 
@@ -632,13 +640,15 @@ def cmd_status(cfg, args):
         state.save()
     except OSError:
         pass
+    scrub = scrub_info(pool, state, report)
     if args.json:
         out = {"state": report.state_label(), "usage": asdict(report.usage),
                "devices": [asdict(d) for d in report.devs],
-               "mounted_degraded": report.mounted_degraded, "balance_running": report.balance_running}
+               "mounted_degraded": report.mounted_degraded, "balance_running": report.balance_running,
+               "scrub": scrub}
         print(json.dumps(out, indent=2, ensure_ascii=False))
     else:
-        print(render_status(report, cfg, state))
+        print(render_status(report, cfg, state, scrub))
 
 
 # ---------------------------------------------------------------- add / remove
@@ -759,8 +769,107 @@ def cmd_remove(cfg, args):
 
 # ---------------------------------------------------------------- snapshot
 
-def scrub_info(pool):
-    """Parse `btrfs scrub status` into a small dict"""
+# btrfs counts scrub errors by class, and the classes are not equally serious:
+#
+#   read / csum / super : a block could not be read, or did not match its checksum.
+#                         Real damage. btrfs also charges these to the device stats.
+#   verify              : a tree block's header did not say what the extent tree
+#                         expected. Genuine metadata damage looks like this — and so
+#                         does a block that was freed and reused while the scrub was
+#                         still reading it, which is ordinary on a filesystem under
+#                         heavy write. From the summary line alone the two are
+#                         indistinguishable.
+#
+# Reporting both as one red light makes a busy pool cry wolf, and a pool that cries
+# wolf is one nobody reads. So a verify-only result with clean device counters is a
+# question ("look at this") rather than a verdict ("your data is damaged"), and once
+# a human has looked, `braidctl scrub --ack` records that instead of forcing a choice
+# between a five-hour re-scrub and deleting btrfs's own record.
+SCRUB_HARD = ("read_errors", "csum_errors", "super_errors")
+SCRUB_SOFT = ("verify_errors",)
+
+
+def parse_scrub_raw(text):
+    """`btrfs scrub status -R` prints one `name: value` per counter, tab-indented"""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"\s+([a-z_]+):\s+(-?\d+)\s*$", line)
+        if m:
+            out[m[1]] = int(m[2])
+    return out
+
+
+def parse_scrub_devices(text):
+    """`btrfs scrub status -R -d` repeats those counters under a per-device header"""
+    devs, cur = [], None
+    for line in text.splitlines():
+        m = re.match(r"Scrub device (\S+) \(id (\d+)\)", line)
+        if m:
+            cur = {"path": m[1], "devid": int(m[2]), "counters": {}}
+            devs.append(cur)
+            continue
+        m = re.match(r"\s+([a-z_]+):\s+(-?\d+)\s*$", line)
+        if m and cur is not None:
+            cur["counters"][m[1]] = int(m[2])
+    return devs
+
+
+def scrub_errors(counters):
+    """Non-zero error classes only, in the short form btrfs uses on its summary line"""
+    return {k.replace("_errors", ""): counters[k]
+            for k in SCRUB_HARD + SCRUB_SOFT + ("uncorrectable_errors", "corrected_errors")
+            if counters.get(k)}
+
+
+def scrub_signature(info):
+    """What an acknowledgement is bound to: this scrub run and this result.
+    A later scrub, or the same scrub reporting more, does not match and rings again."""
+    c = info.get("counters") or {}
+    parts = ",".join(f"{k}={c[k]}" for k in sorted(SCRUB_HARD + SCRUB_SOFT + ("uncorrectable_errors",)) if c.get(k))
+    return f"{info.get('started')}|{parts}"
+
+
+def scrub_judgement(info, report=None, ack=None):
+    """(level, text) for the last scrub — ok / info (reviewed) / warn (look) / fail (damage)"""
+    counters = info.get("counters") or {}
+    if not counters:
+        return "ok", "no scrub has run yet"
+    hard = {k: counters[k] for k in SCRUB_HARD if counters.get(k)}
+    soft = {k: counters[k] for k in SCRUB_SOFT if counters.get(k)}
+    corrected = counters.get("corrected_errors", 0)
+    uncorrectable = counters.get("uncorrectable_errors", 0)
+    where = ""
+    for d in info.get("devices") or []:
+        if any(d["errors"].get(k.replace("_errors", "")) for k in SCRUB_HARD + SCRUB_SOFT):
+            where = f" on {os.path.basename(d['path'])} (devid {d['devid']})"
+            break
+    show = lambda d: " ".join(f"{k.replace('_errors', '')}={v}" for k, v in d.items())
+
+    if hard:
+        if corrected and not uncorrectable:
+            # The mirror did its job. Still worth saying out loud: a drive is
+            # handing back blocks that do not match what was written to it.
+            return "warn", (f"scrub repaired {corrected} block(s) from the mirror "
+                            f"({show(hard)}{where}) — the drive returned bad data but nothing was lost")
+        return "fail", f"scrub found damaged data: {show(hard)}{where}, {uncorrectable} uncorrectable"
+
+    if soft:
+        dev_errs = sum(sum((d.errors or {}).values()) for d in report.devs) if report else 0
+        if dev_errs:
+            return "fail", (f"scrub found {show(soft)}{where} and the devices report "
+                            f"{dev_errs} I/O error(s) — treat this as real")
+        if ack:
+            when = time.strftime("%Y-%m-%d", time.localtime(ack.get("at", 0)))
+            return "info", f"scrub reported {show(soft)}{where}; reviewed {when}"
+        return "warn", (f"scrub reported {show(soft)}{where}, but no data failed its checksum "
+                        f"(csum=0 read=0) and the device error counters are clean. "
+                        f"A block freed and reused mid-scrub looks exactly like this. "
+                        f"Re-scrub while the pool is idle, or `braidctl scrub --ack` once reviewed")
+    return "ok", "no errors found"
+
+
+def scrub_info(pool, state=None, report=None):
+    """Parse `btrfs scrub status` into a small dict, with braidctl's own reading of it"""
     out = {}
     for line in pool.scrub_status().splitlines():
         m = re.match(r"\s*(Status|Scrub started|Scrub resumed|Duration|Total to scrub|Rate|Error summary):\s+(.*)", line)
@@ -774,6 +883,17 @@ def scrub_info(pool):
             info["started"] = int(time.mktime(time.strptime(out["Scrub started"], "%a %b %d %H:%M:%S %Y")))
         except ValueError:
             pass
+    info["counters"] = parse_scrub_raw(pool.scrub_status(raw=True))
+    info["errors"] = scrub_errors(info["counters"])
+    # The per-device breakdown costs another btrfs call, so only pay for it when
+    # there is something to attribute.
+    info["devices"] = [{"path": d["path"], "devid": d["devid"], "errors": scrub_errors(d["counters"])}
+                       for d in parse_scrub_devices(pool.scrub_status(raw=True, per_device=True))
+                       if scrub_errors(d["counters"])] if info["errors"] else []
+    saved = (state.data.get("scrub_ack") if state else None) or None
+    ack = saved if saved and saved.get("signature") == scrub_signature(info) else None
+    info["ack"] = ack
+    info["level"], info["text"] = scrub_judgement(info, report=report, ack=ack)
     return info
 
 
@@ -825,7 +945,7 @@ def write_snapshot(cfg, pool, report, state, note=None):
             "verdict": {"level": level, "text": text},
             "missing_since": {k: int(v) for k, v in state.data.get("missing", {}).items()},
             "rebuild": state.data.get("rebuild"),
-            "scrub": scrub_info(pool),
+            "scrub": scrub_info(pool, state, report),
         })
     try:
         p = Path(path)
@@ -1120,28 +1240,58 @@ def cmd_monitor(cfg, args):
 
 # ---------------------------------------------------------------- scrub / mount
 
+def scrub_ack(cfg, pool):
+    """Record that a human looked at the last scrub result and found nothing wrong.
+
+    Without this the only ways out of a stale verify-only result are a five-hour
+    re-scrub or deleting btrfs's own status file — one costs a night of I/O, the
+    other destroys the record. Damage is deliberately not acknowledgeable."""
+    state = State(cfg["state_file"]).load()
+    info = scrub_info(pool, state, collect(pool))
+    if not info.get("counters"):
+        raise BraidError("no scrub result to acknowledge")
+    if not info["errors"]:
+        raise BraidError("the last scrub reported no errors; nothing to acknowledge")
+    if info["level"] == "fail":
+        raise BraidError(f"{info['text']}\n"
+                         "This is damage, not a false alarm, and cannot be acknowledged away")
+    if info["level"] == "info":
+        print(info["text"])
+        return
+    state.data["scrub_ack"] = {"signature": scrub_signature(info), "at": int(time.time()),
+                               "summary": info["error_summary"], "started": info["started"]}
+    state.save()
+    print(f"acknowledged: {info['error_summary']} (scrub of "
+          f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(info['started'] or 0))}). "
+          "The next scrub that reports anything different will raise it again")
+
+
 def cmd_scrub(cfg, args):
     require_root()
     pool = Pool(cfg)
     notifier = Notifier(cfg)
     if not pool.is_mounted():
         raise BraidError(f"{cfg['mountpoint']} is not mounted")
+    if args.ack:
+        return scrub_ack(cfg, pool)
     if "running" in pool.scrub_status():
         raise BraidError("a scrub is already running")
     LOG.info("scrub starting")
     p = run(["btrfs", "scrub", "start", "-B", "-d", cfg["mountpoint"]], check=False)
-    status = pool.scrub_status()
-    errs = re.search(r"Error summary:\s+(.*)", status)
-    summary = errs[1].strip() if errs else "unknown"
-    ok = p.returncode == 0 and (summary.startswith("no errors") or summary == "")
-    body = f"exit={p.returncode}\n{p.stdout}\n{status}"
-    if ok:
-        LOG.info("scrub finished: %s", summary)
-        if not args.quiet:
-            notifier.send("Scrub finished, no errors", body)
-    else:
-        notifier.send("Scrub found errors", body)
+    state = State(cfg["state_file"]).load()
+    info = scrub_info(pool, state, collect(pool))
+    body = f"exit={p.returncode}\n{p.stdout}\n{pool.scrub_status(per_device=True)}"
+    if info["level"] == "fail":
+        notifier.send("Scrub found damaged data", f"{info['text']}\n\n{body}")
         sys.exit(1)
+    if info["level"] == "warn":
+        # Neither silence nor an alarm: somebody has to look, once.
+        LOG.warning("scrub needs review: %s", info["text"])
+        notifier.send("Scrub needs review", f"{info['text']}\n\n{body}")
+        return
+    LOG.info("scrub finished: %s", info["text"])
+    if not args.quiet:
+        notifier.send("Scrub finished, no errors", body)
 
 
 def cmd_guard(cfg, args):
@@ -1266,6 +1416,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_monitor)
 
     s = sub.add_parser("scrub", help="verify every block against its checksum")
+    s.add_argument("--ack", action="store_true",
+                   help="do not scrub: record the last result as reviewed (refused for real damage)")
     s.add_argument("--quiet", action="store_true", help="do not notify on success")
     s.set_defaults(fn=cmd_scrub)
 

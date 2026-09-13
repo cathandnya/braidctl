@@ -806,6 +806,15 @@ def check_addable(cfg, pool, dev, force):
         raise BraidError(f"{dev} does not exist")
     if not stat.S_ISBLK(st.st_mode):
         raise BraidError(f"{dev} is not a block device")
+    # A card reader or an empty bay is a block device with no medium. Refuse it before
+    # anything else looks at it: udev creates no /dev/disk/by-id link for a device with
+    # no medium, so protected_devices — which matches those links — cannot see it.
+    try:
+        size = int(Path(f"/sys/class/block/{os.path.basename(dev)}/size").read_text())
+    except (OSError, ValueError):
+        size = None
+    if size == 0:
+        raise BraidError(f"refusing {dev}: it has no medium (0 bytes) — an empty card reader or bay")
 
     # The system disk, anything mounted, and anything with a holder are refused even with --force
     root_src = run(["findmnt", "-no", "SOURCE", "/"]).stdout.strip()

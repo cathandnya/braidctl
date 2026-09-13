@@ -728,8 +728,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/devices/candidates":
             core, cfg = self.ctx["core"], self.ctx["cfg"]
             allow = bool(cfg["web"].get("allow_force_add"))
+            holder = core.lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
+            # Same rule as the Remove buttons: an add needs the pool lock, so while
+            # something holds it, offer nothing that would be refused on click.
             return self.send_json(200, {"candidates": candidates(core, cfg, allow),
-                                        "allow_force_add": allow})
+                                        "allow_force_add": allow,
+                                        "busy": holder["cmdline"] if holder else None})
 
         if path == "/api/jobs":
             jobs = self.ctx["jobs"]

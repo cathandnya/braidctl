@@ -234,6 +234,9 @@
     let d;
     try { d = await (await fetch('/api/devices/candidates')).json(); }
     catch (e) { box.appendChild(el('p', 'dim', e.message)); return; }
+    if (d.busy) {
+      box.appendChild(el('p', 'why', `another operation holds the pool, so nothing can be added until it finishes: ${d.busy}`));
+    }
     for (const c of d.candidates || []) {
       if (c.status === 'member') continue;
       const row = el('div', 'cand');
@@ -242,7 +245,9 @@
       // Refused drives stay on screen with the reason braidctl gave. Hiding them sends
       // the operator to a terminal with lsblk, which is where the wrong sdX gets typed.
       row.appendChild(el('div', 'why', c.reason || ''));
-      if (c.status === 'ok') {
+      if (d.busy) {
+        // listed, with its reason, but no button while the pool is held
+      } else if (c.status === 'ok') {
         const b = el('button', null, 'Add');
         b.addEventListener('click', () => askConfirm({ action: 'add', device: c.path },
           `braidctl add ${c.path}`,
@@ -259,6 +264,10 @@
             'wipefs runs first. Everything on that drive is gone, and this cannot be undone.');
         });
         row.appendChild(b);
+      }
+      if (c.status === 'has_data' && !d.busy) {
+        row.appendChild(el('div', 'why',
+          'erasing it from here needs [web] allow_force_add = true; the page then asks for its serial before it runs'));
       }
       box.appendChild(row);
     }

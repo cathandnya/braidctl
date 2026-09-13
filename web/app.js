@@ -218,6 +218,7 @@
         current = { id: job.id, offset: 0 };
         $('job-log').textContent = '';
         pollJob();
+        refreshCandidates();
       } catch (e) {
         banner('fail', e.message);
       }
@@ -228,12 +229,19 @@
     });
   }
 
+  // The list is a snapshot of lsblk, so anything that changes the pool (a job from this
+  // page, the monitor, someone at a terminal) leaves it stale. Re-read while it is open.
+  function refreshCandidates() {
+    if (!$('candidates').hidden) loadCandidates();
+  }
+
   async function loadCandidates() {
     const box = $('candidates');
-    clear(box);
     let d;
     try { d = await (await fetch('/api/devices/candidates')).json(); }
-    catch (e) { box.appendChild(el('p', 'dim', e.message)); return; }
+    catch (e) { clear(box); box.appendChild(el('p', 'dim', e.message)); return; }
+    // Clear only once the answer is in, so a periodic refresh doesn't flash an empty panel.
+    clear(box);
     if (d.busy) {
       box.appendChild(el('p', 'why', `another operation holds the pool, so nothing can be added until it finishes: ${d.busy}`));
     }
@@ -312,7 +320,7 @@
         if (stick) pre.scrollTop = pre.scrollHeight;
       }
       if (['queued', 'running'].includes(job.state)) setTimeout(pollJob, 2000);
-      else { poll(); current = null; }
+      else { poll(); refreshCandidates(); current = null; }
     } catch (e) {
       setTimeout(pollJob, 5000);
     }
@@ -352,6 +360,6 @@
   poll();
   loadJobs();
   setInterval(poll, POLL_MS);
-  setInterval(() => { if (!current) loadJobs(); }, POLL_MS * 3);
+  setInterval(() => { if (!current) loadJobs(); refreshCandidates(); }, POLL_MS * 3);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 }());

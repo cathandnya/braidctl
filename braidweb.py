@@ -211,6 +211,8 @@ class PoolView:
         core, cfg = self.core, self.cfg
         pool = core.Pool(cfg)
         state = core.State(cfg["state_file"]).load()
+        lock_path = Path(cfg["state_file"]).with_suffix(".lock")
+        holder = core.lock_holder(lock_path)
         if not pool.is_mounted():
             present = pool.member_devices_present()
             note = f"{cfg['mountpoint']} is not mounted. Members visible: {', '.join(present) or 'none'}"
@@ -220,9 +222,7 @@ class PoolView:
             for d in report.devs:
                 d.smart = self.smart.get(d.devid, {})
             snap = core.snapshot_dict(cfg, pool, report, state)
-            snap["removable"] = self._removable(report, core, cfg)
-        lock_path = Path(cfg["state_file"]).with_suffix(".lock")
-        holder = core.lock_holder(lock_path)
+            snap["removable"] = self._removable(report, core, cfg, holder)
         snap["lock"] = {"held": bool(holder), "pid": holder["pid"] if holder else None,
                         "cmdline": holder["cmdline"] if holder else None}
         snap["config"] = {"debounce_sec": cfg["debounce_sec"], "warn_percent": cfg["warn_percent"],
@@ -231,12 +231,27 @@ class PoolView:
         snap["smart_at"] = int(self.smart_at) if getattr(self, "smart_at", 0) else None
         return snap
 
-    def _removable(self, report, core, cfg):
+    def _removable(self, report, core, cfg, holder=None):
         """Whether each drive could be removed right now, decided by the same predicate
-        the CLI uses. The page must never offer a button the CLI would refuse."""
+        the CLI uses. The page must never offer a button the CLI would refuse.
+
+        Capacity is not the only thing the CLI checks: a remove also needs the pool lock,
+        so while anything holds it — another remove, an add, a monitor-driven rebuild —
+        every drive is unremovable for now, and saying so is more honest than a button
+        that fails when pressed. The drive already on its way out is recognisable without
+        asking anyone: `btrfs device remove` shrinks its size to zero before relocating,
+        so nothing new is allocated there."""
         out = {}
         for d in report.devs:
             if d.missing or not d.present:
+                continue
+            if d.size == 0:
+                out[str(d.devid)] = {"ok": False, "removing": True,
+                                     "reason": "being removed: its data is being relocated to the other drives"}
+                continue
+            if holder:
+                out[str(d.devid)] = {"ok": False,
+                                     "reason": f"another operation holds the pool: {holder.get('cmdline') or 'braidctl'}"}
                 continue
             ok, after, needed = core.can_rebuild(report, cfg, losing=[d])
             out[str(d.devid)] = {"ok": bool(ok)} if ok else {

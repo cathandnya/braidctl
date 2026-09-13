@@ -117,8 +117,11 @@
       tr.appendChild(health);
 
       const act = el('td', null, null, '');
-      if (!dev.missing && !(d.config || {}).read_only) {
-        const r = (d.removable || {})[String(dev.devid)] || {};
+      const r = (d.removable || {})[String(dev.devid)] || {};
+      if (r.removing) {
+        // Already on its way out: no button, just what is happening to it.
+        act.appendChild(el('span', 'why', 'removing — data is being relocated'));
+      } else if (!dev.missing && !(d.config || {}).read_only) {
         const b = el('button', null, 'Remove');
         b.disabled = r.ok !== true;
         if (r.reason) b.title = r.reason;            // the CLI's own refusal, verbatim

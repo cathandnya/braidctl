@@ -10,6 +10,8 @@ Two rules shape everything here:
 1. It never mutates the pool in a request. Reads are answered from a short-lived cache;
    anything that changes the pool is handed to a transient systemd unit running the
    ordinary CLI, so the argv in the audit log is the argv a human would have typed.
+   The one exception is stopping: `braidctl cancel` is run in the request, because it
+   returns in seconds and must not wait for the job slot the thing it stops is holding.
 2. It holds no lock and runs nothing in the background that the pool depends on. Stop
    it, kill it, never install it: the timers and udev rules that keep the pool alive do
    not involve it.
@@ -32,6 +34,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -223,6 +226,9 @@ class PoolView:
                 d.smart = self.smart.get(d.devid, {})
             snap = core.snapshot_dict(cfg, pool, report, state)
             snap["removable"] = self._removable(report, core, cfg, holder)
+            snap["operations"] = core.running_operations(
+                cfg, pool, holder=holder, balance=snap["balance"],
+                scrub_running=(snap["scrub"] or {}).get("status") == "running")
         snap["lock"] = {"held": bool(holder), "pid": holder["pid"] if holder else None,
                         "cmdline": holder["cmdline"] if holder else None}
         snap["config"] = {"debounce_sec": cfg["debounce_sec"], "warn_percent": cfg["warn_percent"],
@@ -260,6 +266,10 @@ class PoolView:
             }
         return out
 
+    def invalidate(self):
+        with self.lock:
+            self.at = 0
+
     def get(self):
         """live -> last good value -> the status file the monitor wrote -> nothing.
 
@@ -292,6 +302,11 @@ class PoolView:
 
 JOB_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{12}$")
 BRAIDCTL = "/usr/local/sbin/braidctl"
+# What `braidctl cancel` can stop, and which of those each job action is. add, monitor
+# and mount finish in seconds; the balance an add starts outlives its job and is stopped
+# as a balance.
+CANCEL_KINDS = ("scrub", "balance", "remove")
+JOB_CANCELS = {"scrub": "scrub", "remove": "remove"}
 
 
 def new_job_id():
@@ -321,9 +336,28 @@ class Jobs:
 
     def read(self, job_id):
         try:
-            return json.loads(self.path(job_id).read_text())
+            job = json.loads(self.path(job_id).read_text())
         except (OSError, ValueError):
             return None
+        return self.annotate(job)
+
+    def annotate(self, job):
+        # Derived, not stored: a record written before remove became cancellable says
+        # otherwise, and the running job must not be told it cannot be stopped.
+        job["cancellable"] = job.get("action") in JOB_CANCELS
+        job["cancel_requested"] = self.cancel_marker(job["id"]).exists()
+        return job
+
+    # A separate file, because the job rewrites its record every few seconds with
+    # progress: a flag written into the record by this process would be lost to that race.
+    def cancel_marker(self, job_id):
+        return self.path(job_id).with_suffix(".cancel")
+
+    def request_cancel(self, job_id, requested_by):
+        self.cancel_marker(job_id).write_text(json.dumps(requested_by))
+
+    def clear_cancel(self, job_id):
+        self.cancel_marker(job_id).unlink(missing_ok=True)
 
     def write(self, job):
         p = self.path(job["id"])
@@ -336,8 +370,8 @@ class Jobs:
         out = []
         for f in sorted(self.dir.glob("*.json"), reverse=True):
             try:
-                out.append(json.loads(f.read_text()))
-            except (OSError, ValueError):
+                out.append(self.annotate(json.loads(f.read_text())))
+            except (OSError, ValueError, KeyError):
                 continue
         return out
 
@@ -345,7 +379,7 @@ class Jobs:
         keep = self.web["job_retention"]
         done = [j for j in self.all() if j.get("state") in ("done", "failed", "cancelled", "orphaned")]
         for j in done[keep:]:
-            for suffix in (".json", ".log"):
+            for suffix in (".json", ".log", ".cancel"):
                 try:
                     (self.dir / (j["id"] + suffix)).unlink()
                 except OSError:
@@ -382,7 +416,6 @@ class Jobs:
                    "unit": f"braid-job-{job_id}", "runner": "systemd",
                    "created": int(time.time()), "started": None, "finished": None,
                    "state": "queued", "exit": None, "error": None,
-                   "cancellable": action == "scrub",
                    "requested_by": requested_by, "progress": None,
                    "log": str(self.dir / f"{job_id}.log")}
             self.write(job)
@@ -403,13 +436,6 @@ class Jobs:
                 self.write(job)
                 raise Busy(f"could not start the job: {job['error']}", job_id)
             return job
-
-    def cancel(self, job):
-        mnt = self.cfg["mountpoint"]
-        if job["action"] == "scrub":
-            subprocess.run(["btrfs", "scrub", "cancel", mnt], capture_output=True, text=True)
-            return True
-        return False
 
 
 class Busy(Exception):
@@ -468,7 +494,10 @@ def run_job(cfg, args, core):
     try:
         with logfile.open("w") as f:
             os.chmod(logfile, 0o600)
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # Unbuffered, or a pipe holds back stdout while stderr goes straight through and
+            # the log reads out of order: the cancellation before the line saying what started.
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 env=dict(os.environ, PYTHONUNBUFFERED="1"))
             for line in p.stdout:
                 f.write(line)
                 f.flush()
@@ -480,12 +509,17 @@ def run_job(cfg, args, core):
         stop.set()
         cur = jobs.read(args.id) or job
         ok = code == 0 and not err
+        # A cancelled remove exits non-zero and a cancelled scrub exits zero; neither
+        # "failed" nor "done" is what happened.
+        state = "cancelled" if cur.get("cancel_requested") else "done" if ok else "failed"
+        if state == "cancelled":
+            with logfile.open("a") as f:
+                f.write("== cancelled from the web view\n")
         # Leaving the last sample on a finished job shows a bar stuck at whatever it
         # happened to read a few seconds before the end.
-        cur.update(state=("done" if ok else "failed"),
-                   finished=int(time.time()), exit=code, error=err,
-                   progress={"phase": "finished" if ok else "failed",
-                             "pct": 100 if ok else None, "detail": "",
+        cur.update(state=state, finished=int(time.time()), exit=code, error=err,
+                   progress={"phase": "finished" if state == "done" else state,
+                             "pct": 100 if state == "done" else None, "detail": "",
                              "updated": int(time.time())})
         jobs.write(cur)
     return None if code == 0 else sys.exit(code)
@@ -607,6 +641,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", CSP)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for k, v in (extra or {}):
             self.send_header(k, v)
         self.end_headers()
@@ -870,6 +906,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
 
     def do_POST(self):
+        # Most refusals, and routes that take no body, leave the body unread. On a kept-alive
+        # connection those bytes would be parsed as the next request line (a 501 for
+        # `{"kind":"scrub"}GET`), so a POST always ends the connection. They are rare.
+        self.close_connection = True
         if not client_allowed(self.ctx["allow_from"], self.client_address[0]):
             return self.deny(403, "source-not-allowed", "not allowed from this address")
         path, _, _ = self.path.partition("?")
@@ -882,6 +922,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/jobs":
             return self.start_job()
+        if path == "/api/cancel":
+            return self.cancel((self.body_json() or {}).get("kind"))
         m = re.match(r"^/api/jobs/([^/]+)/cancel$", path)
         if m:
             return self.cancel_job(m[1])
@@ -953,12 +995,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.deny(400, "bad-job-id", "bad job id")
         if not job:
             return self.send_json(404, {"error": "no such job"})
-        if not job.get("cancellable"):
-            return self.send_json(409, {"error": "this job cannot be cancelled: btrfs continues "
-                                                 "the work in the kernel even if the command stops"})
-        jobs.cancel(job)
-        self.ctx["log"].warning("AUDIT cancel job=%s addr=%s", job_id, self.client_address[0])
-        return self.send_json(200, {"ok": True})
+        if job.get("state") not in ("queued", "running"):
+            return self.send_json(409, {"error": f"job {job_id} is already {job.get('state')}"})
+        kind = JOB_CANCELS.get(job.get("action"))
+        if not kind:
+            return self.send_json(409, {"error": f"{job.get('action')} is not something that can be stopped "
+                                                 "part-way; it finishes in seconds"})
+        return self.cancel(kind, job)
+
+    def cancel(self, kind, job=None):
+        """Run `braidctl cancel KIND`, which decides whether stopping is safe: the page offers
+        the button from the same running_operations() the command checks.
+
+        A job running the thing being stopped is marked first, so it records "cancelled"
+        rather than "failed" when its command exits."""
+        if kind not in CANCEL_KINDS:
+            return self.deny(400, "bad-params", f"unknown kind {kind!r}")
+        jobs = self.ctx["jobs"]
+        if job is None:
+            job = next((j for j in jobs.unfinished() if JOB_CANCELS.get(j.get("action")) == kind), None)
+        who = {"addr": self.client_address[0], "at": int(time.time())}
+        if job:
+            jobs.request_cancel(job["id"], who)
+        argv = [BRAIDCTL, "-c", self.ctx["cfg"].get("__path__", "/etc/braid/braid.toml"), "cancel", kind]
+        self.ctx["log"].warning("AUDIT cancel kind=%s job=%s addr=%s argv=%s",
+                                kind, job["id"] if job else None, who["addr"], argv)
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=150)
+        except subprocess.TimeoutExpired:
+            return self.send_json(504, {"error": f"`braidctl cancel {kind}` did not return in 150s; "
+                                                 "the page will show whether it stopped"})
+        finally:
+            self.ctx["view"].invalidate()
+        if p.returncode != 0:
+            if job:
+                jobs.clear_cancel(job["id"])
+            lines = (p.stderr or p.stdout).strip().splitlines()
+            msg = lines[-1].removeprefix("braidctl: ") if lines else f"exit {p.returncode}"
+            return self.send_json(409, {"error": msg})
+        return self.send_json(200, {"ok": True, "message": p.stdout.strip()})
 
     def do_OPTIONS(self):
         # No Access-Control-Allow-* header, ever. That is what makes a cross-origin

@@ -130,6 +130,8 @@ sudo braidctl remove missing      # 死んだドライブを手で外す (monito
 sudo braidctl monitor             # 検知を 1 回。timer から 5 分毎に呼ばれる
 sudo braidctl scrub               # 全ブロックをチェックサムと照合
 sudo braidctl scrub --ack         # 直近の結果を確認済みとして記録 (本物の破損には使えない)
+sudo braidctl cancel              # 実行中のもの (scrub / balance / device remove) と止められるかを表示
+sudo braidctl cancel remove       # device remove を止める。ドライブはプールに残る
 sudo braidctl mount               # プールをマウント (--wait N でドライブ出現を待つ)
 sudo braidctl mount-degraded      # 1 台欠けた状態で手動マウント
 ```
@@ -204,6 +206,12 @@ read_only = true
 どのボタンも**実行するコマンドをそのまま見せて**から動く。実際の処理はリクエストの中ではなく
 transient な systemd ユニットとして走るので、数時間かかる remove もページを閉じて構わない。
 拒否はすべて CLI 自身の判断で、CLI が断るドライブは理由付きで並ぶだけでボタンが出ない。
+
+プール上で実行中のもの — タイマーの scrub、`add` の後に残る balance、画面や端末から始めた
+remove — は「Running」に並び、キャンセルボタンが `braidctl cancel` を実行する。remove を
+止めてもドライブはプールに残り、balance を止めてもプールは保護されたまま（空きの偏りが
+残るだけ）。monitor による再冗長化と、raid1 へ戻す convert の balance は、止められない理由と
+一緒に表示される。
 
 `add --force` は `wipefs` を実行する唯一の不可逆操作なので、`[web] allow_force_add = true`
 を書かない限りブラウザからは届かない。書いた場合でも、そのドライブのシリアルを打ち込まないと

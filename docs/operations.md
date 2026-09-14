@@ -64,6 +64,23 @@ admit a used disk is still a terminal:
 sudo braidctl add --force /dev/sdX     # while looking at lsblk
 ```
 
+Anything long-running on the pool is listed under Running with a Cancel button, whoever
+started it — a job from the page, the scrub timer, the balance `add` leaves behind, someone
+at a terminal. The button runs `braidctl cancel scrub|balance|remove`, which is the same
+thing from a shell, and it runs inside the request (it returns in seconds) rather than as a
+job, because the job slot is held by the thing being stopped.
+
+| Stopping | What is left | |
+|---|---|---|
+| scrub | progress kept | `btrfs scrub resume /srv/pool` continues it |
+| balance | the chunks already moved; still raid1 | just less evenly filled |
+| device remove | the drive, still a member, with its size back | data already moved stays moved, mirrored |
+
+It refuses what braidctl would undo or suffer from: a remove or balance the monitor is
+running to re-protect the pool (the next pass would start it again), the compaction
+balance inside a remove (cancel the remove), and a balance converting chunks back to
+raid1, which would leave data written while degraded on one drive with nothing to restart it.
+
 To take the whole thing away, `read_only = true` refuses every mutation at the
 dispatcher, and `allow_mount_actions = false` drops the mount buttons.
 

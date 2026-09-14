@@ -7,6 +7,7 @@ braidctl — Drobo BeyondRAID-style pool management on top of btrfs raid1.
   remove ID|DEV        remove a drive safely (only if what remains can still hold the data)
   monitor              run from a timer: detect losses and failures, re-protect automatically
   scrub                verify every block against its checksum (monthly timer)
+  cancel [WHAT]        stop a running scrub, balance or device remove
   guard                unmount if too few devices remain to write (run from udev)
   mount [--wait N]     mount the pool, degraded if need be (run at boot)
   mount-degraded       mount with a drive missing, by hand
@@ -22,6 +23,7 @@ import json
 import logging
 import os
 import re
+import signal
 import smtplib
 import socket
 import stat
@@ -221,7 +223,8 @@ def lock_holder(path):
                     raw = Path(f"/proc/{entry}/cmdline").read_bytes()
                 except OSError:
                     raw = b""
-                return {"pid": int(entry), "cmdline": raw.decode("utf-8", "replace").replace("\0", " ").strip()}
+                argv = raw.decode("utf-8", "replace").split("\0")
+                return {"pid": int(entry), "cmdline": " ".join(argv).strip(), "argv": [a for a in argv if a]}
     return None
 
 
@@ -511,14 +514,18 @@ class Pool:
         balance_running() used to throw all of that away and keep the boolean. A
         balance is the slowest thing this tool starts — hours on a full pool — and
         the percentage is the only progress it has, so keep it."""
-        p = run(["btrfs", "balance", "status", self.mnt], check=False)
+        # -v adds the filters, which is the only place btrfs says it is converting profiles
+        p = run(["btrfs", "balance", "status", "-v", self.mnt], check=False)
         out = p.stdout
+        lines = out.strip().splitlines()
         info = {"running": "running" in out, "paused": "paused" in out,
+                "converting": "converting" in out,
                 "pct": None, "chunks_done": None, "chunks_total": None, "considered": None,
-                "text": out.strip().splitlines()[-1] if out.strip() else ""}
+                "text": lines[0] if lines else ""}
         m = re.search(r"(\d+) out of about (\d+) chunks balanced \((\d+) considered\)", out)
         if m:
             info["chunks_done"], info["chunks_total"], info["considered"] = int(m[1]), int(m[2]), int(m[3])
+            info["text"] = next(l for l in lines if "chunks balanced" in l).strip()
         m = re.search(r"(\d+)% left", out)
         if m:
             info["pct"] = 100 - int(m[1])
@@ -917,9 +924,17 @@ def cmd_remove(cfg, args):
                          f"(usable afterwards {fmt_bytes(after)} < used {fmt_bytes(needed)}). "
                          f"Add at least {fmt_bytes(short)} first")
     print(f"== removing {names} (usable afterwards {fmt_bytes(after)}, used {fmt_bytes(needed)})")
-    print("   data is relocated first, so this takes a while (btrfs keeps going if you Ctrl-C)")
-    pool.compact()
-    p = pool.remove_device(target, stream=True)
+    print("   data is relocated first, so this takes a while. Ctrl-C (or `braidctl cancel remove`)\n"
+          "   stops it; the drive then stays in the pool")
+    try:
+        pool.compact()
+        p = pool.remove_device(target, stream=True)
+    except KeyboardInterrupt:
+        # subprocess.run has already killed the btrfs child, and a fatal signal is what the
+        # kernel checks between extents: relocation stops, the device gets its size back
+        # and stays a member. What was already moved stays moved, still mirrored.
+        raise BraidError(f"cancelled: {names} stays in the pool. Data already relocated off it "
+                         "stays on the other drives, mirrored as before")
     if p.returncode != 0:
         raise BraidError(f"btrfs device remove failed (exit {p.returncode}). "
                          "If it was ENOSPC, the remaining drives lack unallocated space: run "
@@ -1501,9 +1516,180 @@ def cmd_scrub(cfg, args):
         LOG.warning("scrub needs review: %s", info["text"])
         notifier.send("Scrub needs review", f"{info['text']}\n\n{body}")
         return
+    if info["status"] in ("aborted", "interrupted"):
+        # Cancelled — by `braidctl cancel`, or by a rebuild that needed the disks. What it
+        # found before that was reported above; "finished, no errors" would be a lie.
+        LOG.warning("scrub %s after %s; `btrfs scrub resume %s` continues it",
+                    info["status"], info["duration"], cfg["mountpoint"])
+        print(f"scrub {info['status']} after {info['duration']}")
+        return
     LOG.info("scrub finished: %s", info["text"])
     if not args.quiet:
         notifier.send("Scrub finished, no errors", body)
+
+
+# ---------------------------------------------------------------- cancel
+
+def braidctl_subcommand(argv):
+    """'remove' out of [python3, /usr/local/sbin/braidctl, -c, x.toml, remove, 3]"""
+    it = iter(argv[1:])
+    for a in it:
+        if a in ("-c", "--config"):
+            next(it, None)
+        elif not (a.startswith("-") or a.endswith(("braidctl", ".py"))):
+            return a
+    return None
+
+
+def btrfs_processes(mnt):
+    """btrfs commands acting on this mountpoint, as {pid, ppid, argv}.
+
+    A device remove, like a foreground balance, does its work inside the ioctl of the
+    process that asked for it, and relocation checks for a fatal signal between extents.
+    That is what makes signalling the process a way to stop the work."""
+    want = os.path.realpath(mnt)
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            argv = [a for a in Path(f"/proc/{entry}/cmdline").read_bytes().decode("utf-8", "replace").split("\0") if a]
+            if len(argv) < 3 or os.path.basename(argv[0]) != "btrfs" or os.path.realpath(argv[-1]) != want:
+                continue
+            ppid = int(Path(f"/proc/{entry}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        out.append({"pid": int(entry), "ppid": ppid, "argv": argv})
+    return out
+
+
+def is_remover(proc):
+    return "device" in proc["argv"] and bool({"remove", "delete"} & set(proc["argv"]))
+
+
+def pid_alive(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def running_operations(cfg, pool, holder=None, balance=None, scrub_running=None):
+    """What is running on the pool that someone might want to stop, and whether stopping it
+    is safe. `braidctl cancel` acts on this and the web page shows it, so they cannot
+    disagree about what may be stopped.
+
+    The three long operations all stop cleanly (docs/testing.md has the loop-device runs):
+    a scrub is cancelled and resumable; a balance stops after the chunk it is moving; a
+    device remove stops when its process gets a fatal signal, and the device gets its size
+    back and stays a member. What is refused is what braidctl would undo or suffer from:
+    the monitor re-protecting the pool, and a convert putting data written while degraded
+    back onto two drives — nothing restarts that one.
+
+    holder, balance and scrub_running are for callers that already have them."""
+    if not pool.is_mounted():
+        return []
+    if holder is None:
+        holder = lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
+    held_by = braidctl_subcommand(holder.get("argv") or []) if holder else None
+    procs = btrfs_processes(pool.mnt)
+    removers = [p for p in procs if is_remover(p)]
+    monitor = ("braidctl monitor is re-protecting the pool; stopping it would only postpone "
+               "that to the next pass")
+    ops = []
+
+    if scrub_running is None:
+        scrub_running = "running" in pool.scrub_status()
+    if scrub_running:
+        ops.append({"kind": "scrub", "label": "scrub", "cancellable": True,
+                    "note": f"Progress is kept: `btrfs scrub resume {pool.mnt}` continues from where it stopped."})
+
+    bal = balance if balance is not None else pool.balance_status()
+    if held_by == "remove" or removers:
+        target = holder["argv"][-1] if held_by == "remove" else removers[0]["argv"][-2]
+        op = {"kind": "remove", "target": target,
+              "label": f"device remove ({'devid ' + target if target.isdigit() else target})",
+              "phase": "compacting" if bal["running"] else "relocating"}
+        if held_by == "monitor":
+            op.update(cancellable=False, reason=monitor)
+        elif target == "missing":
+            op.update(cancellable=True, note=(
+                "The pool stays degraded until a removal of the missing drive completes. The monitor "
+                f"starts one itself once a drive has been gone for {cfg['debounce_sec']} seconds."))
+        else:
+            op.update(cancellable=True, note=(
+                "The drive stays in the pool. Data already moved off it stays on the other drives, "
+                "still mirrored; nothing is lost."))
+        ops.append(op)
+
+    if bal["running"] or bal["paused"]:
+        op = {"kind": "balance", "label": "balance" + ("" if bal["running"] else " (paused)"),
+              "pct": bal["pct"]}
+        if held_by == "monitor":
+            op.update(cancellable=False, reason=monitor)
+        elif held_by == "remove":
+            op.update(cancellable=False, reason="this is the compaction step of the device remove; cancel that instead")
+        elif bal["converting"]:
+            op.update(cancellable=False, reason=(
+                "it is converting chunks back to raid1. Stopping it leaves data written while a "
+                "drive was missing with a single copy, and nothing starts it again"))
+        else:
+            op.update(cancellable=True, note=(
+                "Chunks already balanced stay balanced. The pool stays fully protected; its free "
+                "space is just spread less evenly until a balance runs to the end."))
+        ops.append(op)
+    return ops
+
+
+def cancel_operation(cfg, kind, timeout=120):
+    """Stop one entry of running_operations(). Returns what happened, raises if refused."""
+    pool = Pool(cfg)
+    op = next((o for o in running_operations(cfg, pool) if o["kind"] == kind), None)
+    if op is None:
+        raise BraidError(f"no {kind} is running on {pool.mnt}")
+    if not op["cancellable"]:
+        raise BraidError(f"not cancelling the {kind}: {op['reason']}")
+    if kind == "scrub":
+        run(["btrfs", "scrub", "cancel", pool.mnt], timeout=timeout)
+        return f"scrub cancelled; `btrfs scrub resume {pool.mnt}` continues it"
+    if kind == "balance":
+        # Returns once the kernel has stopped, which is after the chunk it is moving.
+        run(["btrfs", "balance", "cancel", pool.mnt], timeout=timeout)
+        return "balance cancelled"
+
+    LOG.warning("cancelling device remove (%s)", op["target"])
+    holder = lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
+    waiting = []
+    if holder and braidctl_subcommand(holder["argv"]) == "remove":
+        # The braidctl first, so it cannot move on to its next step. Its KeyboardInterrupt
+        # kills the btrfs child it is waiting on, compaction balance or device remove.
+        os.kill(holder["pid"], signal.SIGINT)
+        waiting.append(holder["pid"])
+        time.sleep(1)
+    for p in btrfs_processes(pool.mnt):
+        # A remove run as plain `btrfs device remove`, or a child the braidctl has not
+        # killed yet. Any fatal signal will do; btrfs installs no handler.
+        if is_remover(p) or (holder and p["ppid"] == holder["pid"]):
+            os.kill(p["pid"], signal.SIGINT)
+            waiting.append(p["pid"])
+    deadline = time.time() + timeout
+    while any(pid_alive(pid) for pid in waiting):
+        if time.time() > deadline:
+            raise BraidError(f"asked the device remove to stop, but it is still running after {timeout}s")
+        time.sleep(0.5)
+    return f"device remove of {op['target']} cancelled; the drive stays in the pool"
+
+
+def cmd_cancel(cfg, args):
+    require_root()
+    if not args.what:
+        ops = running_operations(cfg, Pool(cfg))
+        for o in ops:
+            print(f"{o['kind']:8} {o['label']}: " + ("cancellable" if o["cancellable"] else f"not cancellable — {o['reason']}"))
+        if not ops:
+            print("nothing is running")
+        return
+    print(cancel_operation(cfg, args.what))
 
 
 def cmd_web(cfg, args):
@@ -1674,6 +1860,10 @@ def main(argv=None):
                    help="do not scrub: record the last result as reviewed (refused for real damage)")
     s.add_argument("--quiet", action="store_true", help="do not notify on success")
     s.set_defaults(fn=cmd_scrub)
+
+    s = sub.add_parser("cancel", help="stop a running scrub, balance or device remove (no argument: list them)")
+    s.add_argument("what", nargs="?", choices=["scrub", "balance", "remove"])
+    s.set_defaults(fn=cmd_cancel)
 
     s = sub.add_parser("guard", help="unmount if too few devices remain to write (for udev)")
     s.set_defaults(fn=cmd_guard)

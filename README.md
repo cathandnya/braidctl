@@ -132,6 +132,8 @@ sudo braidctl remove missing      # evict a dead drive by hand (what monitor doe
 sudo braidctl monitor             # one detection pass; run from the timer every 5 minutes
 sudo braidctl scrub               # verify every block against its checksum
 sudo braidctl scrub --ack         # record the last result as reviewed (refused for real damage)
+sudo braidctl cancel              # what is running (scrub / balance / device remove) and whether it can be stopped
+sudo braidctl cancel remove       # stop a device remove; the drive stays in the pool
 sudo braidctl mount               # mount the pool (--wait N to retry while drives appear)
 sudo braidctl mount-degraded      # mount with a drive missing, by hand
 ```
@@ -209,6 +211,13 @@ the pool when it is down. Each button shows the exact command first, and the wor
 a transient systemd unit rather than inside the request, so a remove that takes hours
 survives the page being closed. Every refusal is the CLI's own: a drive the CLI would
 decline is listed with that reason and no button.
+
+Whatever is running on the pool — a scrub from the timer, the balance an `add` leaves
+behind, a remove started from the page or a terminal — is listed with a Cancel button
+that runs `braidctl cancel`. A cancelled remove leaves the drive in the pool; a cancelled
+balance leaves the pool protected, just less evenly filled. What the monitor is doing to
+re-protect the pool, and a balance converting chunks back to raid1, are shown with the
+reason they cannot be stopped.
 
 `add --force` runs `wipefs` and is the one irreversible operation in the tool, so it is
 not reachable from a browser unless `[web] allow_force_add = true`, and even then only

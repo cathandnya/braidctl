@@ -42,8 +42,19 @@
     PROTECTED: 'ok', REBUILDING: 'warn', DEGRADED: 'fail', UNPROTECTED: 'fail', UNMOUNTED: 'fail',
   };
 
+  let lastStatus = null;
+  // render() rebuilds the banners on every poll, so the outcome of something the operator
+  // just did has to be re-added for a while or it is gone before it can be read.
+  let notice = null;
+  function announce(level, text) {
+    notice = { level, text, until: Date.now() + 60000 };
+    banner(level, text);
+  }
+
   function render(d) {
+    lastStatus = d;
     clear($('banners'));
+    if (notice && Date.now() < notice.until) banner(notice.level, notice.text);
     $('label').textContent = d.label || 'braid';
     $('mountpoint').textContent = d.mountpoint || '';
     const state = d.state || '?';
@@ -128,7 +139,7 @@
         b.addEventListener('click', () => askConfirm(
           { action: 'remove', target: String(dev.devid) },
           `braidctl remove ${dev.devid}`,
-          `${dev.name} ${dev.model || ''} ${bytes(dev.size)}. Data is relocated first, which can take hours, and it cannot be cancelled once started.`));
+          `${dev.name} ${dev.model || ''} ${bytes(dev.size)}. Data is relocated first, which can take hours. It can be cancelled while it runs; the drive then stays in the pool.`));
         act.appendChild(b);
         if (r.ok !== true && r.reason) act.appendChild(el('div', 'why', r.reason));
       }
@@ -148,6 +159,8 @@
       $('scrub').textContent = 'no scrub has run yet';
     }
 
+    renderOperations(d);
+
     const unmounted = state === 'UNMOUNTED';
     for (const a of ['mount', 'mount-degraded']) {
       const b = document.querySelector(`[data-action="${a}"]`);
@@ -158,6 +171,41 @@
     $('smart-age').textContent = d.smart_at
       ? `health as of ${new Date(d.smart_at * 1000).toLocaleTimeString()}` : 'health from the last monitor pass';
     $('lock').textContent = d.lock && d.lock.held ? `busy: ${d.lock.cmdline || 'another braidctl'}` : '';
+  }
+
+  // What is running on the pool, however it was started: a job from this page, the
+  // scrub timer, the balance an add leaves behind, someone at a terminal. Whether each
+  // can be stopped is the server's call, from the same check `braidctl cancel` makes.
+  let stopping = null;           // the kind whose cancel request is still in flight
+
+  function renderOperations(d) {
+    const ops = d.operations || [];
+    const box = $('ops');
+    clear(box);
+    $('ops-card').hidden = !ops.length;
+    const readOnly = (d.config || {}).read_only;
+    for (const op of ops) {
+      const row = el('div', 'cand');
+      let pct = op.pct;
+      if (op.kind === 'scrub' && d.scrub) pct = d.scrub.pct;
+      row.appendChild(el('div', null, [op.label, op.phase,
+        pct !== null && pct !== undefined ? pct + '%' : null].filter(Boolean).join(' · ')));
+      if (!op.cancellable) {
+        row.appendChild(el('div', 'why', `can't be cancelled here: ${op.reason}`));
+      } else if (!readOnly) {
+        row.appendChild(el('div', 'why', op.note || ''));
+        const b = el('button', null, stopping === op.kind ? 'Stopping…' : 'Cancel…');
+        b.disabled = stopping === op.kind;
+        b.addEventListener('click', () => askCancel('/api/cancel', op));
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    }
+  }
+
+  function askCancel(path, op) {
+    askConfirm({ kind: op.kind }, `braidctl cancel ${op.kind}`,
+      `Stops the ${op.label}. ${op.note || ''}`, { path, yes: 'Stop it', no: 'Keep it running' });
   }
 
   // --- actions ------------------------------------------------------------
@@ -175,8 +223,11 @@
 
   let pending = null;
 
-  function askConfirm(body, cmd, note) {
-    pending = body;
+  function askConfirm(body, cmd, note, opts) {
+    opts = opts || {};
+    pending = { body, path: opts.path || '/api/jobs' };
+    $('confirm-yes').textContent = opts.yes || 'Run it';
+    $('confirm-no').textContent = opts.no || 'Cancel';
     $('confirm-title').textContent = cmd;
     $('confirm-cmd').textContent = 'sudo ' + cmd;
     $('confirm-note').textContent = note || '';
@@ -210,12 +261,28 @@
     $('confirm-no').addEventListener('click', () => { $('confirm').close(); pending = null; });
     $('confirm-yes').addEventListener('click', async () => {
       $('confirm').close();
-      const action = pending;
+      const req = pending;
       pending = null;
-      if (!action) return;
+      if (!req) return;
+      if (req.path !== '/api/jobs') {
+        // A stop. A balance only stops after the chunk it is moving, so this can take a
+        // while; say so rather than leaving a button that looks like it did nothing.
+        stopping = req.body.kind;
+        if (lastStatus) renderOperations(lastStatus);
+        try {
+          const res = await post(req.path, req.body);
+          announce('info', res.message || `${req.body.kind} cancelled`);
+        } catch (e) {
+          announce('fail', e.message);
+        } finally {
+          stopping = null;
+          poll();
+        }
+        return;
+      }
       try {
-        const job = await post('/api/jobs', action);
-        current = { id: job.id, offset: 0 };
+        const res = await post(req.path, req.body);
+        current = { id: res.id, offset: 0 };
         $('job-log').textContent = '';
         pollJob();
         refreshCandidates();
@@ -223,9 +290,12 @@
         banner('fail', e.message);
       }
     });
-    $('job-cancel').addEventListener('click', async () => {
+    $('job-cancel').addEventListener('click', () => {
       if (!current) return;
-      try { await post(`/api/jobs/${current.id}/cancel`); } catch (e) { banner('fail', e.message); }
+      const kind = $('job-cancel').dataset.kind;
+      const op = ((lastStatus || {}).operations || []).find((o) => o.kind === kind)
+        || { kind, label: kind };
+      askCancel(`/api/jobs/${current.id}/cancel`, op);
     });
   }
 
@@ -299,9 +369,14 @@
     bar.style.width = (p.pct !== null && p.pct !== undefined ? Math.min(100, p.pct) : 0) + '%';
     $('job-detail').textContent = [p.phase, p.pct !== null && p.pct !== undefined ? p.pct + '%' : null,
       p.detail, p.time_left ? p.time_left + ' left' : null].filter(Boolean).join(' · ');
-    // Cancel only where cancelling means anything: btrfs keeps relocating after a
-    // device remove is interrupted, so a button there would be a lie.
-    $('job-cancel').hidden = !(job.cancellable && job.state === 'running');
+    // Cancel only where cancelling means anything: a scrub or a device remove. add,
+    // monitor and mount are over in seconds; the balance an add starts is listed under
+    // Running once the add has finished.
+    const cancel = $('job-cancel');
+    cancel.hidden = !(job.cancellable && job.state === 'running');
+    cancel.disabled = !!job.cancel_requested;
+    cancel.textContent = job.cancel_requested ? 'Stopping…' : 'Cancel…';
+    cancel.dataset.kind = job.action;
     $('job-log').hidden = !$('job-log').textContent;
     if (job.error) banner('fail', `${job.action}: ${job.error}`);
   }
@@ -311,6 +386,12 @@
     try {
       const job = await (await fetch(`/api/jobs/${current.id}`)).json();
       renderJob(job);
+      // Once its command has had a moment to start, refresh the Running card rather than
+      // leaving it a status interval behind the job.
+      if (job.state === 'running' && !current.seenRunning) {
+        current.seenRunning = true;
+        setTimeout(poll, 1500);
+      }
       const log = await (await fetch(`/api/jobs/${current.id}/log?offset=${current.offset}`)).json();
       if (log.text) {
         const pre = $('job-log');

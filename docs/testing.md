@@ -71,6 +71,26 @@ sudo braidctl $C add --force /dev/loopN
 sudo braidctl $C scrub
 ```
 
+### Stopping things
+
+Put 6 GB or so on the pool first, so there is something to relocate. For a compaction
+phase long enough to interrupt, leave half-empty chunks behind: write a couple of thousand
+1 MiB files and delete two in three.
+
+```bash
+sudo braidctl $C remove 3 &            # relocating devid 3
+sudo braidctl $C cancel                # lists: remove cancellable
+sudo braidctl $C cancel remove         # returns in about a second
+sudo btrfs fi show --raw $T/mnt        # devid 3 has its size back (it is 0 while removing)
+sudo braidctl $C status                # PROTECTED, four drives
+sudo btrfs balance start --bg --full-balance $T/mnt && sudo braidctl $C cancel balance
+sudo btrfs balance start --bg -dconvert=raid1 $T/mnt && sudo braidctl $C cancel balance   # refused
+sudo braidctl $C scrub & sleep 2; sudo braidctl $C cancel scrub   # the scrub reports "aborted", no "finished" mail
+```
+
+Then the same from the page: a remove, a scrub and a background balance, each stopped from
+its Cancel button. A job that was cancelled records `cancelled`, not `failed`.
+
 ## Simulating failure on real hardware
 
 Do not use `/sys/bus/usb/drivers/usb/unbind` — many enclosures present two disks behind one USB
@@ -153,6 +173,9 @@ Recorded on the development machine: Ubuntu 26.04, Linux 7.0, btrfs-progs 6.17.1
 | `remove` refused / accepted | loop | Refused the drive that would not fit, relocated and removed the one that would |
 | `add` refusal and `--force` | both | Signature detected, refused, forced through |
 | Degraded mount at boot | loop | Mounts `-o degraded` when the normal mount fails |
+| Stopping a device remove | loop | SIGTERM to `btrfs device remove`: exited in 0.25 s, device size restored, still raid1. `braidctl cancel remove` during relocation and during compaction alike: stopped in ~1 s, drive still a member |
+| Stopping a balance | loop | `balance cancel` returned in 0.3 s, running or paused; a convert is refused |
+| Stopping a scrub | loop | Status `aborted`; no "finished, no errors" notification |
 
 Not yet exercised: a full reboot with a drive absent, and long-term behaviour under a real Time
 Machine workload.

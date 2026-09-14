@@ -251,23 +251,28 @@ class State:
                      "rebuild": None, "smart_base": {}, "scrub_ack": None}
         self._lock_fh = None
 
-    def lock(self, quiet=False):
+    def lock(self, quiet=False, wait=0):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fh = open(self.path.with_suffix(".lock"), "w")
-        try:
-            fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if quiet:
-                # A udev-triggered pass while another is already working is not a
-                # problem: the work is being done. Several fire at once when a bus
-                # re-enumerates and every member device reappears.
-                LOG.info("another braidctl holds the lock; nothing to do")
-                return False
-            holder = lock_holder(self.path.with_suffix(".lock"))
-            who = f": {holder['cmdline']}" if holder and holder.get("cmdline") else ""
-            raise BraidError(f"another braidctl is already running{who}. "
-                             "A monitor-driven rebuild holds this for as long as it takes")
-        return True
+        deadline = time.time() + max(0, wait)
+        while True:
+            try:
+                fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(1)
+        if quiet:
+            # A udev-triggered pass while another is already working is not a
+            # problem: the work is being done. Several fire at once when a bus
+            # re-enumerates and every member device reappears.
+            LOG.info("another braidctl holds the lock; nothing to do")
+            return False
+        holder = lock_holder(self.path.with_suffix(".lock"))
+        who = f": {holder['cmdline']}" if holder and holder.get("cmdline") else ""
+        raise BraidError(f"another braidctl is already running{who}. "
+                         "A monitor-driven rebuild holds this for as long as it takes")
 
     def unlock(self):
         if self._lock_fh:
@@ -1149,8 +1154,15 @@ def describe(dev, state):
             f"{fmt_bytes(known.get('size') or dev.size)} ({os.path.basename(known.get('path') or dev.path or '?')})")
 
 
-def ensure_mounted(cfg, pool, notifier, state):
-    """Mount normally, else degraded. Returns whether the pool ended up mounted."""
+def ensure_mounted(cfg, pool, notifier, state, degraded=True):
+    """Mount normally, else degraded. Returns whether the pool ended up mounted.
+
+    degraded=False is for the udev-triggered pass. At boot it fires on the FIRST member to
+    appear, while the rest are still enumerating: a normal mount fails for want of devices,
+    and a degraded fallback would then succeed with drives that are seconds away. Deciding
+    that a drive is really absent is braid-mount's job (it waits for enumeration) and the
+    timer's. After a guard unmount the udev pass still recovers the pool: the normal mount
+    succeeds as the last member returns."""
     if pool.is_mounted():
         return True
     present = pool.member_devices_present()
@@ -1165,6 +1177,13 @@ def ensure_mounted(cfg, pool, notifier, state):
         LOG.info("mounted normally")
         state.clear_notify("no-members")
         return True
+    if pool.is_mounted():
+        # Another braidctl that does not take the lock (or an admin) got there first.
+        LOG.info("mount failed because the pool was mounted meanwhile: %s", p.stderr.strip())
+        return True
+    if not degraded:
+        LOG.info("normal mount failed; not trying degraded from this pass: %s", p.stderr.strip())
+        return False
     LOG.warning("normal mount failed: %s — trying degraded", p.stderr.strip())
     p = pool.mount(degraded=True, check=False)
     if p.returncode != 0:
@@ -1299,7 +1318,7 @@ def cmd_monitor(cfg, args):
     now = time.time()
     debounce = args.debounce if args.debounce is not None else cfg["debounce_sec"]
 
-    if not ensure_mounted(cfg, pool, notifier, state):
+    if not ensure_mounted(cfg, pool, notifier, state, degraded=not args.if_idle):
         state.save()
         write_snapshot(cfg, pool, None, state, note=f"{cfg['mountpoint']} is not mounted")
         return
@@ -1585,15 +1604,20 @@ def cmd_mount(cfg, args):
     wrong response to losing a drive. See docs/design.md."""
     require_root()
     pool = Pool(cfg)
+    deadline = time.time() + max(0, args.wait)
+    # At boot the udev rule starts a monitor pass as the members appear, at the same moment
+    # as this. Unlocked, the two raced: one mount lost with EBUSY and fell back to degraded.
+    # Holding the lock makes that pass exit as idle; waiting for it covers the reverse order.
+    state = State(cfg["state_file"])
+    state.lock(wait=args.wait)
     # Quiet retry loop: right after boot the USB bus is still enumerating, and
     # "not yet" is not a failure worth an email.
-    deadline = time.time() + max(0, args.wait)
     while not pool.is_mounted() and time.time() < deadline:
         if pool.member_devices_present() and pool.mount(check=False).returncode == 0:
             break
         time.sleep(5)
     notifier = Notifier(cfg)
-    state = State(cfg["state_file"]).load()
+    state.load()
     if not ensure_mounted(cfg, pool, notifier, state):   # degraded fallback, and notify
         state.save()
         raise BraidError(f"could not mount {cfg['mountpoint']}")
@@ -1603,6 +1627,7 @@ def cmd_mount(cfg, args):
 
 def cmd_mount_degraded(cfg, args):
     require_root()
+    lock = hold_lock(cfg)                      # noqa: F841 — released when this returns
     pool = Pool(cfg)
     if pool.is_mounted():
         print("already mounted")

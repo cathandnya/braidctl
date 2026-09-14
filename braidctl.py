@@ -251,7 +251,7 @@ class State:
     def __init__(self, path):
         self.path = Path(path)
         self.data = {"missing": {}, "err_base": {}, "last_notify": {}, "inventory": {},
-                     "rebuild": None, "smart_base": {}, "scrub_ack": None}
+                     "rebuild": None, "smart_base": {}, "scrub_ack": None, "err_scrub_base": None}
         self._lock_fh = None
 
     def lock(self, quiet=False, wait=0):
@@ -551,6 +551,36 @@ class Pool:
                 out[int(m[1])] = (int(m[2]), int(m[3]))
         return out
 
+    def stale_superblocks(self, devids):
+        """{devid: (oldest copy's generation, filesystem generation)} for the given devices
+        whose superblock copies are behind right now; {} when all are current; None when
+        it cannot tell.
+
+        A reference device is read first and the ones in question after it. A commit
+        between the reads can only move the later reads ahead, never behind, so a copy
+        that reads lower than the reference really is stale."""
+        paths = {}
+        for line in run(["btrfs", "filesystem", "show", "--raw", self.mnt], check=False).stdout.splitlines():
+            m = re.search(r"devid\s+(\d+)\s+size\s+\d+\s+used\s+\d+\s+path\s+(/\S+)", line)
+            if m:
+                paths[int(m[1])] = m[2]
+
+        def generations(path):
+            out = run(["btrfs", "inspect-internal", "dump-super", "-a", path], check=False).stdout
+            return [int(g) for g in re.findall(r"^generation\s+(\d+)", out, re.M)]
+        others = [d for d in paths if d not in devids]
+        ref = generations(paths[others[0]]) if others else []
+        if not ref or any(d not in paths for d in devids):
+            return None
+        stale = {}
+        for d in devids:
+            gens = generations(paths[d])
+            if not gens:
+                return None
+            if min(gens) < max(ref):
+                stale[d] = (min(gens), max(ref))
+        return stale
+
     def scrub_status(self, raw=False, per_device=False):
         argv = ["btrfs", "scrub", "status"]
         if raw:
@@ -754,8 +784,11 @@ def render_status(report, cfg, state=None, scrub=None, balance=None):
     lines.append("")
     lines.append(f"{'ID':>2}  {'device':8} {'model':22} {'size':>9} {'alloc':>9}  {'errors':>6}  health")
     inv = (state.data.get("inventory", {}) if state else {})
+    older = []
     for d in report.devs:
-        errs = sum(d.errors.values()) if d.errors else 0
+        errs = errors_since_scrub(d, state)
+        if d.errors and sum(d.errors.values()) != errs:
+            older.append(f"devid {d.devid} {sum(d.errors.values())}")
         _, health = device_health(d)
         if d.missing or not d.present:
             known = inv.get(str(d.devid), {})
@@ -766,6 +799,10 @@ def render_status(report, cfg, state=None, scrub=None, balance=None):
             name = d.name
         lines.append(f"{d.devid:>2}  {name:8} {model[:22]:22} {fmt_bytes(d.size):>9} {fmt_bytes(d.used):>9}  "
                      f"{errs:>6}  {health}")
+    since = ((state.data.get("err_scrub_base") or {}).get("scrub_started") if state else None)
+    if since and older:
+        lines.append(f"errors: since the scrub of {time.strftime('%Y-%m-%d %H:%M', time.localtime(since))}"
+                     f" (lifetime: {', '.join(older)})")
     lines.append("")
     lines.append(verdict(report, cfg)[1])
     if pct >= cfg["warn_percent"]:
@@ -947,8 +984,13 @@ def cmd_remove(cfg, args):
 
 # btrfs counts scrub errors by class, and the classes are not equally serious:
 #
-#   read / csum / super : a block could not be read, or did not match its checksum.
+#   read / csum         : a block could not be read, or did not match its checksum.
 #                         Real damage. btrfs also charges these to the device stats.
+#   super               : a superblock copy was unreadable or behind the filesystem's
+#                         generation. Scrub does not repair these because it need not:
+#                         every transaction commit rewrites every copy on every
+#                         device. A drive that was away comes back with all of them
+#                         behind, so what matters is whether they are current NOW.
 #   verify              : a tree block's header did not say what the extent tree
 #                         expected. Genuine metadata damage looks like this — and so
 #                         does a block that was freed and reused while the scrub was
@@ -961,8 +1003,10 @@ def cmd_remove(cfg, args):
 # question ("look at this") rather than a verdict ("your data is damaged"), and once
 # a human has looked, `braidctl scrub --ack` records that instead of forcing a choice
 # between a five-hour re-scrub and deleting btrfs's own record.
-SCRUB_HARD = ("read_errors", "csum_errors", "super_errors")
+SCRUB_HARD = ("read_errors", "csum_errors")
+SCRUB_SUPER = ("super_errors",)
 SCRUB_SOFT = ("verify_errors",)
+SCRUB_ALL = SCRUB_HARD + SCRUB_SUPER + SCRUB_SOFT
 
 
 def parse_scrub_raw(text):
@@ -993,7 +1037,7 @@ def parse_scrub_devices(text):
 def scrub_errors(counters):
     """Non-zero error classes only, in the short form btrfs uses on its summary line"""
     return {k.replace("_errors", ""): counters[k]
-            for k in SCRUB_HARD + SCRUB_SOFT + ("uncorrectable_errors", "corrected_errors")
+            for k in SCRUB_ALL + ("uncorrectable_errors", "corrected_errors")
             if counters.get(k)}
 
 
@@ -1001,42 +1045,82 @@ def scrub_signature(info):
     """What an acknowledgement is bound to: this scrub run and this result.
     A later scrub, or the same scrub reporting more, does not match and rings again."""
     c = info.get("counters") or {}
-    parts = ",".join(f"{k}={c[k]}" for k in sorted(SCRUB_HARD + SCRUB_SOFT + ("uncorrectable_errors",)) if c.get(k))
+    parts = ",".join(f"{k}={c[k]}" for k in sorted(SCRUB_ALL + ("uncorrectable_errors",)) if c.get(k))
     return f"{info.get('started')}|{parts}"
 
 
-def scrub_judgement(info, report=None, ack=None):
-    """(level, text) for the last scrub — ok / info (reviewed) / warn (look) / fail (damage)"""
+def scrub_judgement(info, report=None, ack=None, state=None):
+    """(level, text) for the last scrub — ok / info (reviewed, or nothing left to fix) /
+    warn (look) / fail (damage)"""
     counters = info.get("counters") or {}
     if not counters:
         return "ok", "no scrub has run yet"
     hard = {k: counters[k] for k in SCRUB_HARD if counters.get(k)}
+    supers = {k: counters[k] for k in SCRUB_SUPER if counters.get(k)}
     soft = {k: counters[k] for k in SCRUB_SOFT if counters.get(k)}
     corrected = counters.get("corrected_errors", 0)
     uncorrectable = counters.get("uncorrectable_errors", 0)
-    where = ""
-    for d in info.get("devices") or []:
-        if any(d["errors"].get(k.replace("_errors", "")) for k in SCRUB_HARD + SCRUB_SOFT):
-            where = f" on {os.path.basename(d['path'])} (devid {d['devid']})"
-            break
+
+    def where_for(classes):
+        for d in info.get("devices") or []:
+            if any(d["errors"].get(k.replace("_errors", "")) for k in classes):
+                return f" on {os.path.basename(d['path'])} (devid {d['devid']})"
+        return ""
     show = lambda d: " ".join(f"{k.replace('_errors', '')}={v}" for k, v in d.items())
 
+    # Device I/O errors are what tell a drive that was disconnected (it missed writes, and
+    # the scrub finds them stale) from one that silently hands back wrong data. Once this
+    # scrub is itself the error baseline, the errors that led up to it are no longer
+    # "since", but they still explain its result.
+    dev_errs = sum(errors_since_scrub(d, state) for d in report.devs) if report else 0
+    base = (state.data.get("err_scrub_base") or {}) if state else {}
+    if base.get("scrub_started") and base.get("scrub_started") == info.get("started"):
+        dev_errs += base.get("errors_before", 0)
+
+    def reviewed(classes):
+        when = time.strftime("%Y-%m-%d", time.localtime(ack.get("at", 0)))
+        return f"scrub reported {show(classes)}{where_for(SCRUB_ALL)}; reviewed {when}"
+
+    repaired = corrected and not uncorrectable
     if hard:
-        if corrected and not uncorrectable:
-            # The mirror did its job. Still worth saying out loud: a drive is
-            # handing back blocks that do not match what was written to it.
-            return "warn", (f"scrub repaired {corrected} block(s) from the mirror "
-                            f"({show(hard)}{where}) — the drive returned bad data but nothing was lost")
-        return "fail", f"scrub found damaged data: {show(hard)}{where}, {uncorrectable} uncorrectable"
+        if not repaired:
+            return "fail", f"scrub found damaged data: {show(hard)}{where_for(SCRUB_HARD)}, {uncorrectable} uncorrectable"
+        if ack:
+            return "info", reviewed(hard)
+        cause = (f"the devices report {dev_errs} I/O error(s), as a drive that was disconnected does"
+                 if dev_errs else "the drive returned bad data")
+        return "warn", (f"scrub repaired {corrected} block(s) from the mirror ({show(hard)}{where_for(SCRUB_HARD)}) "
+                        f"— {cause}, but nothing was lost. `braidctl scrub --ack` once reviewed")
+
+    if supers:
+        swhere = where_for(SCRUB_SUPER)
+        stale = info.get("supers_stale")
+        if stale is None:
+            return "warn", (f"scrub found {show(supers)}{swhere}: superblock copies that did not match, "
+                            "and whether they have been rewritten since could not be checked")
+        if stale:
+            behind = ", ".join(f"devid {k} at generation {old} < {cur}" for k, (old, cur) in sorted(stale.items()))
+            return "warn", (f"superblock copies are still behind the filesystem ({behind}); every commit "
+                            "should rewrite them, so writes to that drive may be failing")
+        if not soft:
+            return "info", (f"scrub found {show(supers)}{swhere}: superblock copies that were behind, as a "
+                            "drive that was away comes back. All copies have been rewritten since")
 
     if soft:
-        dev_errs = sum(sum((d.errors or {}).values()) for d in report.devs) if report else 0
+        where = where_for(SCRUB_SOFT)
+        if dev_errs and repaired:
+            # Missed writes read as stale tree blocks, and the mirror rewrote every one.
+            # Real, and already repaired: the same verdict as repaired csum errors.
+            if ack:
+                return "info", reviewed(soft)
+            return "warn", (f"scrub repaired {corrected} block(s) from the mirror ({show(soft)}{where}) — the "
+                            f"devices report {dev_errs} I/O error(s), as a drive that was disconnected does, "
+                            "but nothing was lost. `braidctl scrub --ack` once reviewed")
         if dev_errs:
             return "fail", (f"scrub found {show(soft)}{where} and the devices report "
                             f"{dev_errs} I/O error(s) — treat this as real")
         if ack:
-            when = time.strftime("%Y-%m-%d", time.localtime(ack.get("at", 0)))
-            return "info", f"scrub reported {show(soft)}{where}; reviewed {when}"
+            return "info", reviewed(soft)
         return "warn", (f"scrub reported {show(soft)}{where}, but no data failed its checksum "
                         f"(csum=0 read=0) and the device error counters are clean. "
                         f"A block freed and reused mid-scrub looks exactly like this. "
@@ -1076,8 +1160,58 @@ def scrub_info(pool, state=None, report=None):
     saved = (state.data.get("scrub_ack") if state else None) or None
     ack = saved if saved and saved.get("signature") == scrub_signature(info) else None
     info["ack"] = ack
-    info["level"], info["text"] = scrub_judgement(info, report=report, ack=ack)
+    if info["counters"].get("super_errors"):
+        devids = [d["devid"] for d in info["devices"] if d["errors"].get("super")]
+        info["supers_stale"] = pool.stale_superblocks(devids) if devids else None
+    info["level"], info["text"] = scrub_judgement(info, report=report, ack=ack, state=state)
     return info
+
+
+def errors_since_scrub(d, state):
+    """This device's btrfs error count since the last scrub that left every block good.
+
+    btrfs keeps device error counters forever — across reboots, remounts and a drive
+    being unplugged — and braidctl never resets them. So a drive that was away for two
+    minutes shows its failed reads and writes for the rest of its life, and a real error
+    tomorrow is one more on top of 152,213. A scrub that finished with nothing
+    uncorrectable is the point where every copy was verified or rewritten from a good one;
+    counting from there keeps btrfs's record intact (`btrfs device stats` still shows it)
+    and makes the number mean "since the data was last known good"."""
+    errors = d.errors or {}
+    total = sum(errors.values())
+    base = (((state.data.get("err_scrub_base") or {}).get("devices") or {}).get(str(d.devid))
+            if state else None)
+    if base is None:
+        return total
+    if any(v < base.get(k, 0) for k, v in errors.items()):
+        return total            # reset by hand (`btrfs device stats -z`): all of it is new
+    return sum(max(0, v - base.get(k, 0)) for k, v in errors.items())
+
+
+def record_scrub_baseline(state, info, report):
+    """Take the error-counter baseline from a scrub that left every block good. Once per run.
+
+    That means finished (not cancelled or interrupted), nothing uncorrectable, and no member
+    missing. Blocks repaired from the mirror do not disqualify it: the resync scrub after a
+    drive comes back repairs exactly the writes it missed, and demanding a repair-free scrub
+    would keep that drive's absence on the counter until a second multi-hour scrub. The
+    repairs are not forgotten — the scrub's own result still says so until the next one.
+
+    Recorded by the monitor pass, so errors in the minutes between the scrub ending and that
+    pass fold into the baseline; the pass notifies about any increase before it does."""
+    if info.get("status") != "finished" or not info.get("started") or report.gone:
+        return False
+    if (info.get("counters") or {}).get("uncorrectable_errors"):
+        return False
+    if (state.data.get("err_scrub_base") or {}).get("scrub_started") == info["started"]:
+        return False
+    before = sum(errors_since_scrub(d, state) for d in report.devs)
+    state.data["err_scrub_base"] = {"scrub_started": info["started"], "at": int(time.time()),
+                                    "errors_before": before,
+                                    "devices": {str(d.devid): dict(d.errors or {}) for d in report.devs if d.present}}
+    LOG.info("error counters counted from the scrub of %s",
+             time.strftime("%Y-%m-%d %H:%M", time.localtime(info["started"])))
+    return True
 
 
 def snapshot_dict(cfg, pool, report, state, note=None):
@@ -1114,6 +1248,8 @@ def snapshot_dict(cfg, pool, report, state, note=None):
                 "present": d.present,
                 "errors": d.errors,
                 "errors_total": sum(d.errors.values()) if d.errors else 0,
+                # what the page shows: since the last scrub that left every block good (errors_total is btrfs's lifetime count)
+                "errors_new": errors_since_scrub(d, state),
                 "smart": d.smart,
                 "health": htext,
                 "health_level": hlevel,
@@ -1130,6 +1266,7 @@ def snapshot_dict(cfg, pool, report, state, note=None):
             "verdict": {"level": level, "text": text},
             "missing_since": {k: int(v) for k, v in state.data.get("missing", {}).items()},
             "rebuild": state.data.get("rebuild"),
+            "errors_since": (state.data.get("err_scrub_base") or {}).get("scrub_started"),
             "scrub": scrub_info(pool, state, report),
             "balance": pool.balance_status(),
         })
@@ -1491,6 +1628,7 @@ def cmd_monitor(cfg, args):
     elif pct < cfg["warn_percent"]:
         state.clear_notify("capacity")
 
+    record_scrub_baseline(state, scrub_info(pool, state, report), report)
     state.save()
     write_snapshot(cfg, pool, report, state)
     LOG.info("monitor: %s used=%s usable=%s gone=%d", report.state_label(),
@@ -1563,7 +1701,7 @@ def cmd_scrub(cfg, args):
         return
     LOG.info("scrub finished: %s", info["text"])
     if not args.quiet:
-        notifier.send("Scrub finished, no errors", body)
+        notifier.send("Scrub finished, no errors" if info["level"] == "ok" else "Scrub finished", f"{info['text']}\n\n{body}")
 
 
 # ---------------------------------------------------------------- cancel

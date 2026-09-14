@@ -121,7 +121,14 @@
       tr.appendChild(el('td', null, dev.model || '?', 'model'));
       tr.appendChild(el('td', 'num', bytes(dev.size), 'size'));
       tr.appendChild(el('td', 'num', bytes(dev.alloc), 'alloc'));
-      tr.appendChild(el('td', 'num', dev.errors_total, 'errors'));
+      // Since the last scrub that left every block good; btrfs's lifetime count is kept for
+      // the tooltip, because a drive that was unplugged once carries its failures forever.
+      const errs = el('td', 'num', dev.errors_new ?? dev.errors_total, 'errors');
+      if (dev.errors_new !== undefined && dev.errors_new !== dev.errors_total) {
+        errs.title = `${dev.errors_total} since btrfs started counting`
+          + (d.errors_since ? `; counted from the scrub of ${new Date(d.errors_since * 1000).toLocaleString()}` : '');
+      }
+      tr.appendChild(errs);
       const health = el('td', null, null, 'health');
       health.appendChild(el('span', 'dot ' + (dev.health_level || 'unknown')));
       health.appendChild(document.createTextNode(dev.health || '?'));

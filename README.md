@@ -238,9 +238,10 @@ which it was, because the difference decides whether you have lost data or lost 
 
 | Counter | Meaning | braidctl |
 |---|---|---|
-| `csum`, `read`, `super` | a block could not be read, or did not match its checksum | **fail** — real damage, named per drive. `corrected > 0` with nothing uncorrectable is a **warn**: the mirror repaired it, but a drive handed back bad data |
+| `csum`, `read` | a block could not be read, or did not match its checksum | **fail** — real damage, named per drive. Everything repaired from the mirror (nothing uncorrectable) is a **warn**; with device I/O errors alongside, that is a drive that was disconnected and came back |
+| `super` | a superblock copy was behind or unreadable | checked against the drive **now**: every commit rewrites them, so copies that have caught up are **info** (a returned drive looks like this); copies still behind are a **warn** |
 | `verify` only, device error counters clean | a tree block's header was not what the extent tree expected | **warn — look at it once.** Metadata damage looks like this, and so does a block that was freed and reused while the scrub was still reading it, which is ordinary under heavy write |
-| `verify` plus device I/O errors | as above, but the drives agree something went wrong | **fail** |
+| `verify` plus device I/O errors | as above, but the drives agree something went wrong | **fail**, or a **warn** when the mirror repaired all of it (a returned drive's missed writes) |
 
 A `verify`-only result on a busy pool is a question, not a verdict. Re-scrub while the pool is idle
 to settle it; if you have already checked the data and found it sound, record that:
@@ -250,8 +251,17 @@ sudo braidctl scrub --ack
 ```
 
 The acknowledgement is bound to that scrub run and that result, so the next scrub reporting anything
-different raises it again. Real damage (`csum`/`read`/`super`) cannot be acknowledged away — the
-command refuses. Nothing is deleted either way: `btrfs scrub status` keeps its own record.
+different raises it again. A repaired result can be acknowledged too; damage that was not repaired
+cannot — the command refuses. Nothing is deleted either way: `btrfs scrub status` keeps its own record.
+
+### Device error counters
+
+btrfs's per-drive error counters (`btrfs device stats`) never reset on their own — not on reboot,
+not when a drive is unplugged and comes back — so two minutes of a disconnected drive stay on its
+count for good. The `errors` column therefore counts from the last scrub that finished with nothing
+uncorrectable, the point where every block was verified or repaired; `braidctl status` gives the
+lifetime figure underneath when it differs. The baseline is taken by the monitor pass after such a
+scrub, and btrfs's own counters are left alone. `btrfs device stats -z` still resets them by hand.
 
 ## Safety
 

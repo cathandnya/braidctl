@@ -29,6 +29,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import dataclass, field, asdict
@@ -1225,6 +1226,22 @@ def cancel_scrub_for_rebuild(pool):
     return True
 
 
+def start_scrub_background(pool):
+    """Start a scrub and return at once. Returns (started, what btrfs said).
+
+    Not run(): `btrfs scrub start` without -B forks the scrub into a child that keeps the
+    stdout and stderr it was given (unlike `balance start --bg`, which points them at
+    /dev/null). Given run()'s capture pipes, the child held them open for the whole scrub
+    and run() waited for EOF, so the monitor pass that started it sat there for hours
+    holding the pool lock: every timer pass skipped, and a drive lost meanwhile was
+    neither noticed nor re-protected. A file does not wait for its last writer."""
+    with tempfile.TemporaryFile("w+") as out:
+        p = subprocess.run(["btrfs", "scrub", "start", pool.mnt],
+                           stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+        out.seek(0)
+        return p.returncode == 0, out.read().strip()
+
+
 def rebuild_missing(cfg, pool, notifier, state, report):
     """Evict the missing devices and restore raid1 across the survivors (Drobo's re-layout)"""
     gone = report.gone
@@ -1315,9 +1332,15 @@ def reattach(cfg, pool, notifier, state, returned):
         state.data["missing"].pop(str(devid), None)
     state.clear_notify("cannot-rebuild")
     # Whatever was written while it was away is not on it; scrub rewrites it from the mirror
-    run(["btrfs", "scrub", "start", cfg["mountpoint"]], check=False)
+    started, said = start_scrub_background(pool)
+    if started:
+        resync = "A scrub is running to resync what it missed."
+    else:
+        LOG.warning("could not start the resync scrub: %s", said)
+        resync = (f"The scrub that resyncs what it missed did not start ({said}). "
+                  "Run `sudo braidctl scrub` once the pool is idle.")
     notifier.send("Drive returned and was re-attached",
-                  f"{names} is back in the pool. A scrub is running to resync what it missed.\n\n"
+                  f"{names} is back in the pool. {resync}\n\n"
                   + render_status(new, cfg, state))
     return True
 

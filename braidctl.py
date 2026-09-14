@@ -29,7 +29,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 from dataclasses import dataclass, field, asdict
@@ -1226,20 +1225,35 @@ def cancel_scrub_for_rebuild(pool):
     return True
 
 
-def start_scrub_background(pool):
-    """Start a scrub and return at once. Returns (started, what btrfs said).
+RESYNC_UNIT = "braid-resync-scrub"
 
-    Not run(): `btrfs scrub start` without -B forks the scrub into a child that keeps the
-    stdout and stderr it was given (unlike `balance start --bg`, which points them at
-    /dev/null). Given run()'s capture pipes, the child held them open for the whole scrub
-    and run() waited for EOF, so the monitor pass that started it sat there for hours
-    holding the pool lock: every timer pass skipped, and a drive lost meanwhile was
-    neither noticed nor re-protected. A file does not wait for its last writer."""
-    with tempfile.TemporaryFile("w+") as out:
-        p = subprocess.run(["btrfs", "scrub", "start", pool.mnt],
-                           stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
-        out.seek(0)
-        return p.returncode == 0, out.read().strip()
+
+def start_scrub_background(cfg):
+    """Start a scrub that outlives this process, and return at once. Returns (started, why not).
+
+    It gets a transient unit of its own, running `braidctl scrub`, because both ways of
+    starting it from here went wrong on the real pool:
+
+    - `btrfs scrub start` through run(): without -B, btrfs forks the scrub into a child
+      that keeps the stdout and stderr it was given (unlike `balance start --bg`, which
+      points them at /dev/null). The child held run()'s pipes for the whole scrub and
+      run() waited for EOF, so the monitor pass sat holding the pool lock for hours:
+      every timer pass skipped, and a drive lost meanwhile was neither noticed nor
+      re-protected.
+    - The same child with its output sent elsewhere: the pass returned at once, and the
+      scrub still died a second later with "not finished ... status: -4". The monitor
+      runs as a oneshot service, and when a service ends systemd kills everything left
+      in its cgroup — the scrub included.
+
+    `braidctl scrub` waits for the scrub (-B), notifies if it finds damage, and reports
+    when it is done, so the resync that the re-attach notice promises is seen through."""
+    p = run(["systemd-run", f"--unit={RESYNC_UNIT}", "--collect", "--no-block",
+             "--description=braid pool resync scrub (a member came back)",
+             "-p", "TimeoutStartSec=infinity", "-p", "Nice=10",
+             "-p", "IOSchedulingClass=best-effort", "-p", "IOSchedulingPriority=7",
+             sys.executable, os.path.realpath(__file__), "-c", cfg.get("__path__", CONFIG_PATH), "scrub"],
+            check=False)
+    return p.returncode == 0, (p.stderr or p.stdout).strip()
 
 
 def rebuild_missing(cfg, pool, notifier, state, report):
@@ -1332,9 +1346,10 @@ def reattach(cfg, pool, notifier, state, returned):
         state.data["missing"].pop(str(devid), None)
     state.clear_notify("cannot-rebuild")
     # Whatever was written while it was away is not on it; scrub rewrites it from the mirror
-    started, said = start_scrub_background(pool)
+    started, said = start_scrub_background(cfg)
     if started:
-        resync = "A scrub is running to resync what it missed."
+        resync = (f"A scrub is running to resync what it missed ({RESYNC_UNIT}.service); "
+                  "you will hear when it finishes.")
     else:
         LOG.warning("could not start the resync scrub: %s", said)
         resync = (f"The scrub that resyncs what it missed did not start ({said}). "

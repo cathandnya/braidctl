@@ -170,7 +170,7 @@ Recorded on the development machine: Ubuntu 26.04, Linux 7.0, btrfs-progs 6.17.1
 | SMART reporting | hardware | Flagged `reallocated=1` on a 46,000-hour drive; suppressed on later passes as it was not increasing |
 | Rebuild refused for lack of capacity | loop | Correct shortfall reported, nothing removed |
 | Drive returning before eviction | loop | Re-attached by remount, scrub started |
-| Monitor pass that re-attaches a drive | loop | Exits in ~1 s with the resync scrub still running, and the next pass runs instead of skipping on the lock. Before the fix it waited out the whole scrub (12 s here, 3 h on the real pool) |
+| Monitor pass that re-attaches a drive | loop | Run as a oneshot unit, as udev and the timer run it: exits in ~1 s, and the resync scrub runs to the end in `braid-resync-scrub.service` and reports it. Waiting on btrfs's pipe, it held the lock for the whole scrub (12 s here, 3 h on the real pool); started as its own child, systemd killed the scrub with the unit (`status: -4`) |
 | `remove` refused / accepted | loop | Refused the drive that would not fit, relocated and removed the one that would |
 | `add` refusal and `--force` | both | Signature detected, refused, forced through |
 | Degraded mount at boot | loop | Mounts `-o degraded` when the normal mount fails |

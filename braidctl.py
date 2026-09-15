@@ -349,7 +349,10 @@ class Device:
     size: int
     used: int          # raw bytes allocated to chunks on this device
     missing: bool = False
-    present: bool = True   # whether the device node exists
+    present: bool = True   # whether the device node exists and the mounted filesystem is using it
+    # The node exists and btrfs no longer calls it missing, but the mounted filesystem never
+    # opened it: a drive that appeared after a degraded mount. See Pool.devices().
+    detached: bool = False
     model: str = ""
     serial: str = ""
     tran: str = ""
@@ -456,12 +459,23 @@ class Pool:
             devs.append(d)
         # Trust sysfs over the progs output for the missing flag
         uuid = self.uuid()
+        ro = "ro" in ((self.mount_entry() or {}).get("options") or [])
         for d in devs:
             f = Path(f"/sys/fs/btrfs/{uuid}/devinfo/{d.devid}/missing")
             if f.exists() and f.read_text().strip() == "1":
                 d.missing = True
             d.present = bool(d.path) and os.path.exists(d.path) and not d.missing
-            if d.present:
+            # A drive that turns up after the pool was mounted degraded gets scanned: btrfs
+            # records its path and clears "missing", and `filesystem show` lists it like any
+            # other member. But the mounted filesystem never opens it, so nothing is written
+            # to it — every write that pairs with it lands on one drive. sysfs says so
+            # (writeable 0 on a read-write mount); nothing else does. Counted as present,
+            # it read as PROTECTED for as long as the pool stayed mounted. It is not
+            # present: a remount is what brings it in, which is what the monitor's re-attach does.
+            w = Path(f"/sys/fs/btrfs/{uuid}/devinfo/{d.devid}/writeable")
+            if d.present and not ro and w.exists() and w.read_text().strip() == "0":
+                d.present, d.detached = False, True
+            if d.present or d.detached:
                 info = next(iter(lsblk(d.path)), {})
                 disk = next(iter(lsblk(parent_disk(d.path))), {})
                 d.model = (disk.get("model") or info.get("model") or "").strip()
@@ -726,6 +740,8 @@ def can_rebuild(report, cfg, losing=None):
 def device_health(d):
     """One device's health as (level, text). level: ok / info / warn / fail / missing / unknown.
     'info' is a defect that is present but not growing (a stable reallocated count)."""
+    if d.detached:
+        return "missing", "NOT IN USE (connected; remount to use it)"
     if d.missing or not d.present:
         return "missing", "MISSING"
     s = d.smart
@@ -790,7 +806,7 @@ def render_status(report, cfg, state=None, scrub=None, balance=None):
         if d.errors and sum(d.errors.values()) != errs:
             older.append(f"devid {d.devid} {sum(d.errors.values())}")
         _, health = device_health(d)
-        if d.missing or not d.present:
+        if (d.missing or not d.present) and not d.detached:
             known = inv.get(str(d.devid), {})
             model = known.get("model", "?")
             name = f"(was {os.path.basename(known.get('path', '') or d.path or '?')})"
@@ -1238,7 +1254,7 @@ def snapshot_dict(cfg, pool, report, state, note=None):
             hlevel, htext = device_health(d)
             devices.append({
                 "devid": d.devid,
-                "name": d.name if d.present else f"was {os.path.basename(known.get('path') or d.path or '?')}",
+                "name": d.name if d.present or d.detached else f"was {os.path.basename(known.get('path') or d.path or '?')}",
                 "path": d.path or known.get("path"),
                 "model": d.model or known.get("model"),
                 "serial": d.serial or known.get("serial"),
@@ -1246,6 +1262,7 @@ def snapshot_dict(cfg, pool, report, state, note=None):
                 "alloc": d.used,
                 "missing": d.missing or not d.present,
                 "present": d.present,
+                "detached": d.detached,
                 "errors": d.errors,
                 "errors_total": sum(d.errors.values()) if d.errors else 0,
                 # what the page shows: since the last scrub that left every block good (errors_total is btrfs's lifetime count)
@@ -1544,6 +1561,17 @@ def cmd_monitor(cfg, args):
         key = str(d.devid)
         if key not in missing:
             missing[key] = now
+            if d.detached:
+                # Only reached when the re-attach above did not happen or did not work
+                # (a balance or rebuild running, or the unmount refused while something is busy).
+                notifier.send("A drive is connected but the pool is not using it",
+                              f"{describe(d, state)} is attached, but the pool was mounted without it and "
+                              "nothing is being written to it. A remount brings it back in:\n"
+                              "  sudo systemctl stop smbd && sudo umount "
+                              f"{cfg['mountpoint']} && sudo braidctl mount && sudo systemctl start smbd\n"
+                              f"Otherwise it is treated as lost: after {int(debounce)} seconds the pool is "
+                              "re-protected without it.\n\n" + render_status(report, cfg, state))
+                continue
             notifier.send("Drive lost",
                           f"{describe(d, state)} disappeared.\n"
                           f"If it does not return within {int(debounce)} seconds, the pool will be "

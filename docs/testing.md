@@ -174,6 +174,7 @@ Recorded on the development machine: Ubuntu 26.04, Linux 7.0, btrfs-progs 6.17.1
 | `remove` refused / accepted | loop | Refused the drive that would not fit, relocated and removed the one that would |
 | `add` refusal and `--force` | both | Signature detected, refused, forced through |
 | Degraded mount at boot | loop | Mounts `-o degraded` when the normal mount fails |
+| A member that appears after a degraded mount | dm | Kernel scans it: `missing` 0 but `writeable` 0, and the filesystem does not use it. The old check read that as PROTECTED; now it is DEGRADED / NOT IN USE, the monitor re-attaches it by remount, and the resync scrub repaired the writes it missed |
 | Stopping a device remove | loop | SIGTERM to `btrfs device remove`: exited in 0.25 s, device size restored, still raid1. `braidctl cancel remove` during relocation and during compaction alike: stopped in ~1 s, drive still a member |
 | Stopping a balance | loop | `balance cancel` returned in 0.3 s, running or paused; a convert is refused |
 | Stopping a scrub | loop | Status `aborted`; no "finished, no errors" notification |

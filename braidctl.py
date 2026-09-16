@@ -418,6 +418,44 @@ class Pool:
                 out.append(n["path"])
         return out
 
+    def members_complete(self):
+        """(complete, devids seen, devices expected) for the pool as it can be mounted now.
+
+        A normal mount with a member absent cannot succeed, and it fails the dangerous way:
+        btrfs starts reading metadata from the members it found, gives up on the missing one,
+        and tears the half-built filesystem down while those reads are still completing. On
+        2026-09-16 (Linux 7.0) one completed after the workqueue it reports to was destroyed
+        — "cannot queue simple_end_io_work on wq btrfs-endio-meta", then a page fault in
+        btrfs_simple_end_io — and the kernel panicked. The member had been re-enumerated
+        0.4 s earlier and its disk node did not exist yet. So a normal mount is attempted only
+        when every member is attached: each superblock records how many devices the
+        filesystem has, and the kernel's own device-ready check has to agree. The kernel check
+        alone is not enough — it still counts a path registered before the node vanished.
+
+        An evicted drive that still carries the label and fsid can make the count look
+        complete; the kernel check usually catches that, and the cost is a failed mount."""
+        newest, devids, paths = None, set(), []
+        for path in self.member_devices_present():
+            p = run(["btrfs", "inspect-internal", "dump-super", path], check=False)
+            fields = dict(re.findall(r"^(fsid|generation|num_devices|dev_item\.devid)\s+(\S+)", p.stdout, re.M))
+            if not {"fsid", "generation", "num_devices", "dev_item.devid"} <= fields.keys():
+                continue
+            sb = {"path": path, "fsid": fields["fsid"], "generation": int(fields["generation"]),
+                  "num_devices": int(fields["num_devices"]), "devid": int(fields["dev_item.devid"])}
+            paths.append(sb)
+            if newest is None or sb["generation"] > newest["generation"]:
+                newest = sb
+        if newest is None:
+            return False, set(), 0
+        for sb in paths:
+            if sb["fsid"] == newest["fsid"]:
+                devids.add(sb["devid"])
+        expected = newest["num_devices"]
+        if len(devids) < expected:
+            return False, devids, expected
+        ready = run(["btrfs", "device", "ready", newest["path"]], check=False).returncode == 0
+        return ready, devids, expected
+
     @staticmethod
     def superblock(path):
         """Read (fsid, devid) out of a device's btrfs superblock"""
@@ -1341,19 +1379,25 @@ def ensure_mounted(cfg, pool, notifier, state, degraded=True):
                           f"{cfg['mountpoint']} is not mounted and no btrfs member with "
                           f"LABEL={cfg['label']} can be found.\nCheck the USB hub and power.")
         return False
-    p = pool.mount(check=False)
-    if p.returncode == 0:
-        LOG.info("mounted normally")
-        state.clear_notify("no-members")
-        return True
-    if pool.is_mounted():
-        # Another braidctl that does not take the lock (or an admin) got there first.
-        LOG.info("mount failed because the pool was mounted meanwhile: %s", p.stderr.strip())
-        return True
+    complete, devids, expected = pool.members_complete()
+    if complete:
+        p = pool.mount(check=False)
+        if p.returncode == 0:
+            LOG.info("mounted normally")
+            state.clear_notify("no-members")
+            return True
+        if pool.is_mounted():
+            # Another braidctl that does not take the lock (or an admin) got there first.
+            LOG.info("mount failed because the pool was mounted meanwhile: %s", p.stderr.strip())
+            return True
+        why = f"normal mount failed: {p.stderr.strip()}"
+    else:
+        # See Pool.members_complete: a normal mount that is bound to fail is not harmless.
+        why = f"{len(devids)} of {expected} members attached, so no normal mount was attempted"
     if not degraded:
-        LOG.info("normal mount failed; not trying degraded from this pass: %s", p.stderr.strip())
+        LOG.info("%s; not trying degraded from this pass", why)
         return False
-    LOG.warning("normal mount failed: %s — trying degraded", p.stderr.strip())
+    LOG.warning("%s — trying degraded", why)
     p = pool.mount(degraded=True, check=False)
     if p.returncode != 0:
         if state.should_notify("mount-failed", cfg["remind_interval_sec"]):
@@ -1480,8 +1524,8 @@ def reattach(cfg, pool, notifier, state, returned):
         pool.umount()
         for p, _ in returned:
             run(["btrfs", "device", "scan", p], check=False)
-        if pool.mount(check=False).returncode != 0:
-            LOG.warning("normal mount failed -> degraded")
+        if not (pool.members_complete()[0] and pool.mount(check=False).returncode == 0):
+            LOG.warning("members incomplete or normal mount failed -> degraded")
             pool.mount(degraded=True)
     except BraidError as e:
         notifier.send("Failed to re-attach a returned drive", f"{names}\n{e}")
@@ -2003,7 +2047,7 @@ def cmd_mount(cfg, args):
     # Quiet retry loop: right after boot the USB bus is still enumerating, and
     # "not yet" is not a failure worth an email.
     while not pool.is_mounted() and time.time() < deadline:
-        if pool.member_devices_present() and pool.mount(check=False).returncode == 0:
+        if pool.members_complete()[0] and pool.mount(check=False).returncode == 0:
             break
         time.sleep(5)
     notifier = Notifier(cfg)

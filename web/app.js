@@ -112,6 +112,13 @@
       if (removable && removable.ok === false) banner('fail', `cannot re-protect without devid ${devid}: ${removable.reason}`);
     }
 
+    // What the per-drive bars are measured against. btrfs places a new chunk as one extent
+    // on each of the drives with the most unallocated space, so what runs out is bytes on a
+    // drive, not a percentage of the pool — the same quantity chunk_headroom() watches.
+    // Defaults match DEFAULT_CONFIG, for the status-file fallback that carries no config.
+    const headWarn = (d.config && d.config.chunk_headroom_warn) || 16 * 1024 ** 3;
+    const headFail = (d.config && d.config.chunk_headroom_fail) || 2 * 1024 ** 3;
+
     const tb = $('drives').querySelector('tbody');
     clear(tb);
     for (const dev of d.devices || []) {
@@ -121,6 +128,22 @@
       tr.appendChild(el('td', null, dev.model || '?', 'model'));
       tr.appendChild(el('td', 'num', bytes(dev.size), 'size'));
       tr.appendChild(el('td', 'num', bytes(dev.alloc), 'alloc'));
+      // How full this drive is, which the headline bar cannot show: that one is the pool's
+      // logical capacity, and a pool at 70% can still have one drive with nothing left to
+      // allocate. An uneven row of bars is what a balance is for.
+      const barCell = el('td', 'barcol');
+      if (dev.size > 0 && !dev.missing) {
+        const free = dev.size - dev.alloc;
+        const pct = Math.min(100, (dev.alloc / dev.size) * 100);
+        const fill = el('div', free < headFail ? 'fail' : free < headWarn ? 'warn' : '');
+        fill.style.width = pct + '%';
+        const box = el('div', 'bar mini');
+        box.appendChild(fill);
+        barCell.appendChild(box);
+        barCell.title = `${bytes(dev.alloc)} of ${bytes(dev.size)} allocated (${pct.toFixed(0)}%), `
+          + `${bytes(free)} unallocated`;
+      }
+      tr.appendChild(barCell);
       // Since the last scrub that left every block good; btrfs's lifetime count is kept for
       // the tooltip, because a drive that was unplugged once carries its failures forever.
       const errs = el('td', 'num', dev.errors_new ?? dev.errors_total, 'errors');

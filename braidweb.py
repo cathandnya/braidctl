@@ -233,6 +233,10 @@ class PoolView:
                         "cmdline": holder["cmdline"] if holder else None}
         snap["config"] = {"debounce_sec": cfg["debounce_sec"], "warn_percent": cfg["warn_percent"],
                           "rebuild_margin": cfg["rebuild_margin"],
+                          # what colours the per-drive allocation bars, so the page uses this
+                          # machine's thresholds rather than a copy of the defaults
+                          "chunk_headroom_warn": cfg["chunk_headroom_warn"],
+                          "chunk_headroom_fail": cfg["chunk_headroom_fail"],
                           "read_only": self.web["read_only"], "mountpoint": cfg["mountpoint"]}
         snap["smart_at"] = int(self.smart_at) if getattr(self, "smart_at", 0) else None
         return snap

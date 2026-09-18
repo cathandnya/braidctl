@@ -146,7 +146,10 @@
       tr.appendChild(barCell);
       // Since the last scrub that left every block good; btrfs's lifetime count is kept for
       // the tooltip, because a drive that was unplugged once carries its failures forever.
-      const errs = el('td', 'num', dev.errors_new ?? dev.errors_total, 'errors');
+      // Zero is the normal case and is worth no ink: the card drops it entirely, and only a
+      // count that is actually there gets a line of its own.
+      const count = dev.errors_new ?? dev.errors_total;
+      const errs = el('td', 'num ' + (Number(count) > 0 ? 'bad' : 'zero'), count, 'errors');
       if (dev.errors_new !== undefined && dev.errors_new !== dev.errors_total) {
         errs.title = `${dev.errors_total} since btrfs started counting`
           + (d.errors_since ? `; counted from the scrub of ${new Date(d.errors_since * 1000).toLocaleString()}` : '');

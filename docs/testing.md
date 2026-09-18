@@ -102,7 +102,30 @@ echo '- - -' | sudo tee /sys/class/scsi_host/hostN/scan   # bring it back (hostN
 readlink -f /sys/block/sdX/device                         # find hostN before you delete it
 ```
 
-### The web UI
+### The web UI, without a pool
+
+Layout work does not need a filesystem. `contrib/mock-web.py` serves the real
+`web/index.html`, `app.js` and `app.css` — the files that get installed, not a copy —
+against canned API responses, as an ordinary user with no btrfs and no root:
+
+```bash
+contrib/mock-web.py --list                       # the scenarios and what each one shows
+contrib/mock-web.py -s degraded                  # http://127.0.0.1:8799/
+contrib/mock-web.py -s full -l 0.0.0.0:8799      # to open it from a phone
+```
+
+The scenarios exist because the states worth designing for are the awkward ones, and they
+are tedious to stage on the loop testbed and impossible to stage on purpose on a pool you
+care about: a missing drive with no allocation to draw, one shrunk to zero while a remove
+relocates off it, a model name long enough to wrap, an error count that is not zero,
+unallocated space down to the last gigabyte, a scrub and a balance running at once under a
+held lock. Buttons work: a mutation returns a fake job that finishes after a few seconds,
+so the Job card and the cancel flow can be looked at too.
+
+It proves nothing about the numbers — that is what the loop testbed below is for, where the
+page and `braidctl status` have to agree. It is for looking at the page.
+
+### The web UI, against a real pool
 
 `contrib/loop-testbed.sh up` now writes a `[web]` block into the test config, so the UI
 can be pointed at the loop pool instead of the real one. Run it in the foreground:

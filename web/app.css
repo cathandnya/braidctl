@@ -44,6 +44,7 @@ th, td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); }
 tr:last-child td { border-bottom: 0; }
 .num { text-align: right; }
 .barcol { width: 110px; }
+td.bad { color: var(--fail); }        /* errors since the last good scrub: not a normal number */
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 .dot.ok { background: var(--ok); } .dot.info { background: var(--info); }
 .dot.warn { background: var(--warn); } .dot.fail, .dot.missing { background: var(--fail); }
@@ -56,28 +57,42 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .big { font-size: 28px; }
   table thead { display: none; }
   table, tbody { display: block; width: 100%; }
-  /* One card per drive, three lines: what it is, how full it is, how it is doing.
-     Twelve columns so each line can have its own proportions — with shared auto columns
-     the model name is squeezed by however wide "alloc 1.54 TB" happens to be. Only the
-     start column is stated; the rows follow from grid auto-placement in document order,
-     so a drive with no bar or no button simply has no cell there. Gaps are padding, not
-     column-gap: eleven gaps between twelve tracks would eat a phone's width. */
+  /* One card per drive. Twelve columns so each line can have its own proportions — with
+     shared auto columns the model name is squeezed by however wide "alloc 900.00 GB"
+     happens to be. Row and column are both stated rather than left to auto-placement,
+     because health has to sit on the first line and comes after errors in the document.
+     Gaps are cell padding, not column-gap: eleven gaps between twelve tracks would eat a
+     third of a phone's width.
+
+         id 1   device sdb      health ● OK 41°C
+         model ThinkPlus
+         1.54 TB / 2.00 TB      ▓▓▓▓▓▓▓░░░
+         errors 3                                  (only when there are some)
+         [ Remove ]                                                            */
   tr { display: grid; grid-template-columns: repeat(12, 1fr); row-gap: 3px;
        align-items: center; border: 1px solid var(--line); border-radius: 8px;
        padding: 8px; margin-bottom: 8px; }
   td, td.num { display: block; border: 0; padding: 0 8px 0 0; text-align: left; }
   td::before { content: attr(data-k) " "; color: var(--dim); }
-  td[data-k="id"]     { grid-column: 1 / span 2; }
-  td[data-k="device"] { grid-column: 3 / span 4; }
-  /* A long model name wraps onto a second line rather than being truncated: with /dev/sdX
-     unstable across a bus re-enumeration, the model is how a drive is identified. */
-  td[data-k="model"]  { grid-column: 7 / span 6; }
-  td[data-k="size"]   { grid-column: 1 / span 4; }
-  td[data-k="alloc"]  { grid-column: 5 / span 5; }     /* "alloc 900.00 GB" is the widest one */
-  td.barcol           { grid-column: 10 / span 3; width: auto; }
-  td[data-k="errors"] { grid-column: 1 / span 4; }
-  td[data-k="health"] { grid-column: 5 / span 8; }
-  td:not([data-k]):not(.barcol) { grid-column: 1 / span 12; margin-top: 4px; }   /* the button */
+  td[data-k="id"]     { grid-row: 1; grid-column: 1 / span 2; }
+  td[data-k="device"] { grid-row: 1; grid-column: 3 / span 4; }
+  td[data-k="health"] { grid-row: 1; grid-column: 7 / span 6; }
+  /* A long model name gets the whole line, and wraps rather than being truncated: with
+     /dev/sdX unstable across a bus re-enumeration, the model is what identifies a drive. */
+  td[data-k="model"]  { grid-row: 2; grid-column: 1 / span 12; }
+  /* One reading, "used of the whole", so the bar gets the rest of the line. The labels go:
+     two figures either side of a slash need no naming, and the bar says what they mean. */
+  td[data-k="alloc"]  { grid-row: 3; grid-column: 1 / span 4; }
+  td[data-k="size"]   { grid-row: 3; grid-column: 5 / span 3; }
+  td.barcol           { grid-row: 3; grid-column: 8 / span 5; width: auto; }
+  td[data-k="alloc"]::before, td[data-k="size"]::before { content: none; }
+  /* Right-aligned so the slash ends up against the total instead of a column's worth of
+     air: the two cells have to read as one figure. */
+  td[data-k="alloc"] { text-align: right; padding-right: 5px; }
+  td[data-k="alloc"]::after { content: " /"; color: var(--dim); }
+  td[data-k="errors"] { grid-row: 4; grid-column: 1 / span 12; }
+  td:not([data-k]):not(.barcol) { grid-row: 5; grid-column: 1 / span 12; margin-top: 4px; }
+  td.zero { display: none; }           /* no errors is not news */
   td:empty { display: none; }          /* a missing or departing drive: no bar, and no gap either */
 }
 
@@ -97,6 +112,9 @@ dialog h2 { color: var(--fg); text-transform: none; letter-spacing: 0; font-size
 #candidates { margin-top: 10px; }
 .cand { display: flex; gap: 10px; align-items: baseline; justify-content: space-between;
         padding: 8px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
-.cand .why { color: var(--dim); font-size: 12px; flex: 1 1 240px; }
+/* The CLI's own refusal, wherever it is shown: under a disabled button in the drives
+   table as much as in the candidate list, where this used to be scoped. */
+.why { color: var(--dim); font-size: 12px; }
+.cand .why { flex: 1 1 240px; }
 td button { padding: 2px 10px; font-size: 12px; }
 #ops .cand:first-child { border-top: 0; padding-top: 0; }

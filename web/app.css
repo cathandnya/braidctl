@@ -55,12 +55,30 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 @media (max-width: 640px) {
   .big { font-size: 28px; }
   table thead { display: none; }
-  table, tbody, tr, td { display: block; width: 100%; }
-  tr { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-bottom: 8px; }
-  td, td.num { border: 0; padding: 2px 0; text-align: left; }
+  table, tbody { display: block; width: 100%; }
+  /* One card per drive, three lines: what it is, how full it is, how it is doing.
+     Twelve columns so each line can have its own proportions — with shared auto columns
+     the model name is squeezed by however wide "alloc 1.54 TB" happens to be. Only the
+     start column is stated; the rows follow from grid auto-placement in document order,
+     so a drive with no bar or no button simply has no cell there. Gaps are padding, not
+     column-gap: eleven gaps between twelve tracks would eat a phone's width. */
+  tr { display: grid; grid-template-columns: repeat(12, 1fr); row-gap: 3px;
+       align-items: center; border: 1px solid var(--line); border-radius: 8px;
+       padding: 8px; margin-bottom: 8px; }
+  td, td.num { display: block; border: 0; padding: 0 8px 0 0; text-align: left; }
   td::before { content: attr(data-k) " "; color: var(--dim); }
-  td.barcol { width: auto; padding: 4px 0 6px; }
-  td.barcol:empty { padding: 0; }      /* a missing or departing drive has no bar, and no gap either */
+  td[data-k="id"]     { grid-column: 1 / span 2; }
+  td[data-k="device"] { grid-column: 3 / span 4; }
+  /* A long model name wraps onto a second line rather than being truncated: with /dev/sdX
+     unstable across a bus re-enumeration, the model is how a drive is identified. */
+  td[data-k="model"]  { grid-column: 7 / span 6; }
+  td[data-k="size"]   { grid-column: 1 / span 4; }
+  td[data-k="alloc"]  { grid-column: 5 / span 5; }     /* "alloc 900.00 GB" is the widest one */
+  td.barcol           { grid-column: 10 / span 3; width: auto; }
+  td[data-k="errors"] { grid-column: 1 / span 4; }
+  td[data-k="health"] { grid-column: 5 / span 8; }
+  td:not([data-k]):not(.barcol) { grid-column: 1 / span 12; margin-top: 4px; }   /* the button */
+  td:empty { display: none; }          /* a missing or departing drive: no bar, and no gap either */
 }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }

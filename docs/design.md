@@ -65,6 +65,25 @@ The margin exists because btrfs needs unallocated room to maneuver — a `device
 squeeze into the last 2% of the pool fails with `ENOSPC` halfway through and leaves you worse off
 than not trying.
 
+### What that last line is allowed to be alarmed about
+
+Two different capacity facts can be true at once, and only one of them is a warning.
+
+*Running out of room for new chunks* has a deadline. btrfs places a chunk as one extent on each of
+two devices, picking the two with the most unallocated space, so allocation stops when the
+second-most-free device does — while `df` still reports space free, because that space is inside
+chunks already allocated. Past that point writes fail, and balance has nowhere to relocate to, so
+the pool can no longer be fixed from inside. `chunk_headroom()` measures exactly this, and it is
+what `chunk_headroom_warn` / `_fail` fire on. The used percentage is only a proxy for it, and a poor
+one: uneven allocation can hit the wall at 80% used, or leave room to spare at 95%.
+
+*Not being able to re-protect after losing the largest drive* has no deadline. Every byte stays
+two-copy at any fill level; what is missing is the room to get back to two copies after a failure,
+and the only fix is hardware. On a mixed-size pool it turns true around 70% full — an ordinary place
+to be — and never clears on its own. Reported as a warning it would be permanently amber, which is
+how a status line stops being read, so it is `info`. It becomes a real warning only when *no* drive
+can be lost and re-protected, which is a different situation and does deserve one.
+
 ## The monitor state machine
 
 `braidctl monitor` runs from a timer every five minutes, under a lock, and is idempotent. Its state

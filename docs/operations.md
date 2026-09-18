@@ -239,6 +239,8 @@ knowing:
 | `debounce_sec` | `600` | Grace period before a rebuild. Raise it for flaky USB |
 | `rebuild_margin` | `0.95` | Fraction of post-loss usable capacity allowed to be occupied |
 | `warn_percent` | `90` | Capacity warning threshold |
+| `chunk_headroom_warn` | `16 GiB` | Unallocated space left on the device a new chunk must land on, below which `status` warns |
+| `chunk_headroom_fail` | `2 GiB` | Same, below which allocation is about to fail outright |
 | `samba_units` | `["smbd"]` | Stopped only for the degraded-remount fallback |
 | `auto_evict_on_errors` | `false` | Evict drives that are failing but still present |
 | `protected_devices` | `[]` | Substrings of `/dev/disk/by-id` names that `add` must always refuse |

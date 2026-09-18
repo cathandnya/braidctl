@@ -12,6 +12,13 @@ debounce_sec = 600
 rebuild_margin = 0.95
 warn_percent = 90
 
+# Near-full, in bytes of unallocated space left on the device a new chunk must land on.
+# btrfs stops being able to allocate when that runs out, which happens while df still
+# reports free space -- so this is a byte count per device, not a percentage of the pool.
+# fail: below one metadata chunk plus reserve. warn: below one data chunk plus headroom.
+chunk_headroom_fail = 2147483648
+chunk_headroom_warn = 17179869184
+
 # Services stopped only for the degraded-remount fallback during a rebuild
 samba_units = ["smbd"]
 

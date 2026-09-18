@@ -47,6 +47,12 @@ DEFAULT_CONFIG = {
     # Rebuild is considered possible when used <= usable_after_loss * this
     "rebuild_margin": 0.95,
     "warn_percent": 90,
+    # Near-full thresholds, in bytes of unallocated space on the device a new chunk
+    # still has to land on (see chunk_headroom). Not a percentage: what runs out is
+    # room for a new chunk, which happens while df still reports free space.
+    # fail: below one metadata chunk plus reserve. warn: below one data chunk plus headroom.
+    "chunk_headroom_fail": 2 * 1024**3,
+    "chunk_headroom_warn": 16 * 1024**3,
     # Services stopped only for the degraded-remount fallback
     "samba_units": ["smbd"],
     "state_file": "/var/lib/braid/state.json",
@@ -762,6 +768,21 @@ def copies_required(profiles):
     return need
 
 
+def chunk_headroom(report):
+    """Unallocated bytes on the least-free device a new chunk still has to land on.
+
+    btrfs allocates a chunk as one extent on each of N distinct devices (N = copies_required),
+    choosing the N with the most unallocated space. Allocation therefore stops when the Nth-most-
+    free device runs out, and that happens while `df` still shows space free: that free space sits
+    inside chunks already allocated and cannot hold a new one. A metadata chunk wants up to 1 GiB,
+    a data chunk up to 10 GiB. This is the number that decides how full the pool can get -- the
+    used percentage is only a proxy for it, and a poor one once allocation is uneven.
+    """
+    need = copies_required(report.usage.profiles)
+    free = sorted((d.size - d.used for d in report.devs if d.present), reverse=True)
+    return free[need - 1] if len(free) >= need else 0
+
+
 def can_rebuild(report, cfg, losing=None):
     """Could the pool be re-protected after losing these devices?
     Returns (ok, usable_after, needed)."""
@@ -812,18 +833,37 @@ def verdict(report, cfg):
     healthy = [d for d in report.devs if d.present]
     if len(healthy) < 2:
         return "fail", "Only one drive present; nothing is mirrored"
+    # Running out of room for new chunks is the one capacity problem with a deadline: past it
+    # writes and metadata fail, and balance has nowhere to relocate to, so it cannot be fixed
+    # from inside. It outranks the re-protection arithmetic below, which has no deadline.
+    head = chunk_headroom(report)
+    if head < cfg["chunk_headroom_fail"]:
+        return "fail", (f"Out of unallocated space ({fmt_bytes(head)} left on the drive a new chunk "
+                        f"must land on). Writes will fail with ENOSPC and balance cannot run. "
+                        f"Delete data or add a drive")
+    if head < cfg["chunk_headroom_warn"]:
+        return "warn", (f"Running out of unallocated space ({fmt_bytes(head)} left on the drive a new "
+                        f"chunk must land on; a data chunk wants 10 GB). Delete data or add a drive")
     largest = max(healthy, key=lambda d: d.size)
     after = report.usable_after_losing(largest)
     if u.used <= after * cfg["rebuild_margin"]:
         return "ok", (f"Any single drive can be lost and re-protected "
                       f"(losing the largest, {largest.name} {fmt_bytes(largest.size)}, "
                       f"leaves {fmt_bytes(after)} usable >= {fmt_bytes(u.used)} used)")
+    # Losing the largest drive would leave too little to re-mirror everything. Nothing is wrong
+    # now and nothing breaks on a schedule -- the data stays two-copy at any fill level; what is
+    # missing is the room to get back to two copies after a failure, and the only fix is hardware.
+    # So this is reported, not warned about: it turns true around 70% full on a mixed-size pool
+    # and never clears on its own, and a standing amber is how a status line stops being read.
     tol = [d.name for d in healthy if u.used <= report.usable_after_losing(d) * cfg["rebuild_margin"]]
-    return "warn", (f"Warning: losing {largest.name} ({fmt_bytes(largest.size)}) cannot be re-protected "
-                    f"(would leave {fmt_bytes(after)} usable < {fmt_bytes(u.used)} used). "
-                    + (f"Only losing {', '.join(tol)} can be recovered automatically"
-                       if tol else "No single drive loss can be recovered automatically")
-                    + ". Consider adding a drive")
+    if tol:
+        short = u.used - after * cfg["rebuild_margin"]
+        return "info", (f"Losing {largest.name} ({fmt_bytes(largest.size)}) would leave "
+                        f"{fmt_bytes(short)} too little to re-protect automatically; losing "
+                        f"{', '.join(tol)} is still covered. Consider adding a drive")
+    return "warn", (f"No single drive can be lost and re-protected automatically: {fmt_bytes(u.used)} "
+                    f"used, and losing {largest.name} would leave {fmt_bytes(after)} usable. "
+                    f"A failure now would leave part of the pool on one copy until a drive is added")
 
 
 def render_status(report, cfg, state=None, scrub=None, balance=None):

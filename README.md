@@ -1,5 +1,7 @@
 # braidctl
 
+[![YouTube](https://github.com/user-attachments/assets/81242adf-0bda-4b59-a75f-779b7b3e249d)](https://youtu.be/LY8Lr1qUUZM)
+
 Drobo BeyondRAID-style storage pool management for btrfs RAID1 on Linux.
 
 Mix drives of any size into one pool, see a single honest "usable capacity" number, and — when a

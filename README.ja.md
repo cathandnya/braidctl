@@ -1,5 +1,7 @@
 # braidctl
 
+[![YouTube](https://github.com/user-attachments/assets/81242adf-0bda-4b59-a75f-779b7b3e249d)](https://youtu.be/LY8Lr1qUUZM)
+
 Linux の btrfs RAID1 に Drobo BeyondRAID 風のプール管理を載せるツール。
 
 容量の異なるドライブを好きに束ね、「使える容量」を 1 つの数字で見て、ドライブが壊れたら

@@ -1041,10 +1041,18 @@ def cmd_balance(cfg, args):
         raise BraidError(f"another braidctl is running: {holder['cmdline']}")
     LOG.info("full balance starting")
     print(f"== balancing {cfg['mountpoint']}: every chunk is rewritten, so this takes hours. "
-          "`braidctl cancel balance` stops it after the chunk it is moving")
-    p = run(["btrfs", "balance", "start", "--full-balance", cfg["mountpoint"]], check=False, capture=False)
+          "`braidctl cancel balance` stops it after the chunk it is moving", flush=True)
+    # Captured, not passed through: a foreground balance prints nothing until it ends, and
+    # a cancelled one still exits 0, so its last line is the only way to tell.
+    p = run(["btrfs", "balance", "start", "--full-balance", cfg["mountpoint"]], check=False)
+    out = (p.stdout + p.stderr).strip()
+    if out:
+        print(out, flush=True)
     if p.returncode != 0:
-        raise BraidError(f"btrfs balance exited {p.returncode} (cancelled, or see the output above)")
+        raise BraidError(f"btrfs balance exited {p.returncode}")
+    if "canceled" in out or "cancelled" in out:
+        LOG.warning("full balance cancelled; the chunks already moved stay where they are")
+        return
     LOG.info("full balance finished")
 
 

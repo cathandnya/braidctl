@@ -220,6 +220,7 @@ class PoolView:
             snap = core.snapshot_dict(cfg, pool, None, state)
             snap["note"] = (f"{cfg['mountpoint']} is not mounted. "
                             f"Members visible: {', '.join(snap['members_visible']) or 'none'}")
+            snap["verdict"]["text"] = snap["note"]
         else:
             report = core.collect(pool, smart=False)
             for d in report.devs:

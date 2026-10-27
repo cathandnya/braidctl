@@ -123,6 +123,11 @@ cancelled balance leaves it that way, just less evenly filled. If a drive is los
 with `auto_evict_on_errors`) while it runs, the monitor cancels the balance and re-protects the pool;
 start it again afterwards.
 
+`add` refuses while the devid it would be given was removed earlier in the same mount (a `remove
+missing`, or the monitor's re-protection, when the evicted drive had the highest devid). On Linux 7.0
+the kernel leaves that devid's sysfs entry behind, the add reuses the devid, and reading the entry
+afterwards panics the kernel. Remount the pool or reboot, then add.
+
 When the old drives are fully allocated, the new one alone cannot take a raid1 chunk (each needs
 room on two drives), so its space is not writable until a balance has run. `add` says so. Before this, `add` started the
 balance itself in the background; from the web view that balance was killed along with the job

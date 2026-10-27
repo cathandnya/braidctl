@@ -503,20 +503,24 @@ class Pool:
         if items is None:
             LOG.info("could not read the device list through %s; using the eviction records", newest["path"])
         evicted = self.evicted_records()
-        stale, members = [], []
         for s in same:
-            gone = (items is not None and (s["devid"], s["uuid"]) not in items) or any(
-                e.get("fsid") == s["fsid"] and e.get("devid") == s["devid"]
-                and s["generation"] < (e.get("generation") or 0) for e in evicted)
-            (stale if gone else members).append(s)
-        for s in stale:
             disk = next(iter(lsblk(parent_disk(s["path"]))), {})
             s["serial"] = (disk.get("serial") or "").strip()
             s["model"] = (disk.get("model") or "").strip()
             s["size"] = disk.get("size")
-            rec = next((e for e in reversed(evicted) if e.get("fsid") == s["fsid"] and e.get("devid") == s["devid"]
-                        and (not e.get("serial") or not s["serial"] or e["serial"] == s["serial"])), None)
-            s["evicted_at"] = rec.get("at") if rec else None
+            s["record"] = eviction_record(evicted, s)
+        # The tree is the answer whenever it can be read, except when the device it was read
+        # through is itself a recorded eviction: then every real member is absent, and that
+        # old tree still lists the drive it was read from. Only then do the records decide —
+        # letting them override a readable tree would turn a wrong record (a restored
+        # state.json, a bug) into a live member that is ignored at boot and offered to wipefs.
+        trust_tree = items is not None and newest["record"] is None
+        stale, members = [], []
+        for s in same:
+            gone = (s["devid"], s["uuid"]) not in items if trust_tree else s["record"] is not None
+            (stale if gone else members).append(s)
+        for s in stale:
+            s["evicted_at"] = s["record"].get("at") if s["record"] else None
         if members:
             newest = max(members, key=lambda s: s["generation"])
         return newest, members, stale
@@ -526,7 +530,7 @@ class Pool:
         attached to it is a member by definition, so when that is all there is, nothing
         is read from the drives"""
         if report is not None:
-            attached = {os.path.realpath(d.path) for d in report.devs if d.path}
+            attached = {os.path.realpath(d.path) for d in report.devs if d.path and d.present}
             if all(os.path.realpath(p) in attached for p in self.member_devices_present()):
                 return []
         return self.scan_members()[2]
@@ -538,7 +542,7 @@ class Pool:
         if p.returncode != 0:
             LOG.info("could not forget %s: %s", path, (p.stderr or p.stdout).strip())
 
-    def members_complete(self):
+    def members_complete(self, scan=None):
         """(complete, devids seen, devices expected) for the pool as it can be mounted now.
 
         A normal mount with a member absent cannot succeed, and it fails the dangerous way:
@@ -554,8 +558,10 @@ class Pool:
 
         A drive evicted while it was absent still carries the label and fsid. Only members
         are counted (see scan_members), and stale drives are dropped from the kernel's
-        registry before it is asked, or they would make its answer wrong in either direction."""
-        newest, members, stale = self.scan_members()
+        registry before it is asked, or they would make its answer wrong in either direction.
+
+        scan is a scan_members() result the caller already has: each one reads every drive."""
+        newest, members, stale = scan or self.scan_members()
         if newest is None:
             return False, set(), 0
         for s in stale:
@@ -586,6 +592,17 @@ class Pool:
         return returned, [s for s in stale if s["fsid"] == uuid]
 
     # -- queries (mounted)
+    def leftover_devinfo(self):
+        """devids the kernel still has a /sys/fs/btrfs/<fsid>/devinfo entry for although the
+        filesystem no longer has the device. Only the names are listed: nothing under them
+        is read, because reading one is what crashes (see cmd_add)."""
+        d = Path(f"/sys/fs/btrfs/{self.uuid()}/devinfo")
+        try:
+            ids = {int(e.name) for e in d.iterdir() if e.name.isdigit()}
+        except OSError:
+            return set()
+        return ids - {dev.devid for dev in self.devices()}
+
     def devices(self):
         p = run(["btrfs", "filesystem", "show", "--raw", self.mnt])
         devs = []
@@ -779,19 +796,25 @@ class Pool:
     def in_fstab(self):
         return run(["findmnt", "--fstab", "-n", self.mnt], check=False).returncode == 0
 
-    def mount(self, degraded=False, check=True):
+    def mount(self, degraded=False, check=True, scan=None):
         """Mount via fstab if there is an entry, otherwise through the member with the newest
         superblock. Not LABEL=: a drive evicted while absent carries the label too, and
-        LABEL= is free to resolve to it"""
+        LABEL= is free to resolve to it. With no member visible there is nothing to mount
+        through, and falling back to LABEL= would mount whatever stale drive has it: an old
+        copy of the pool, writable, diverging from the real one."""
         cmd = ["mount"]
         if self.in_fstab():
             if degraded:
                 cmd += ["-o", "degraded"]
             cmd.append(self.mnt)
         else:
-            newest, members, _ = self.scan_members()
-            source = newest["path"] if members else f"LABEL={self.label}"
-            cmd += ["-o", "degraded,noatime" if degraded else "noatime", source, self.mnt]
+            newest, members, _ = scan or self.scan_members()
+            if not members:
+                msg = f"no member of the pool with LABEL={self.label} is visible"
+                if check:
+                    raise BraidError(msg)
+                return subprocess.CompletedProcess(cmd, 32, "", msg)
+            cmd += ["-o", "degraded,noatime" if degraded else "noatime", newest["path"], self.mnt]
         return run(cmd, check=check)
 
     def umount(self, retries=3):
@@ -1104,6 +1127,17 @@ def cmd_add(cfg, args):
         raise BraidError(f"{cfg['mountpoint']} is not mounted")
     if pool.balance_running():
         raise BraidError("a balance is running; try again once it finishes")
+    # Linux 7.0: `device remove missing` leaves the evicted devid's sysfs devinfo entry
+    # behind. btrfs gives a new device the highest devid + 1, so when the evicted one was
+    # the highest, the add reuses it, cannot create devinfo/<devid> ("duplicate filename"),
+    # and the next read of that entry is a NULL dereference: on 2026-10-27 a loop-device
+    # test panicked the host this way. A remount (or reboot) clears the entry.
+    devids = [d.devid for d in pool.devices()]
+    next_devid = max(devids, default=0) + 1
+    if next_devid in pool.leftover_devinfo():
+        raise BraidError(f"devid {next_devid} was removed from {cfg['mountpoint']} during this mount, and "
+                         "adding now would reuse it, which crashes this kernel. Remount the pool "
+                         "(or reboot) first")
     dev, children = check_addable(cfg, pool, args.device, args.force)
     before = pool.usage()
     if args.force:
@@ -1232,12 +1266,15 @@ def cmd_remove(cfg, args):
                          f"`btrfs balance start --full-balance {cfg['mountpoint']}` and retry, or add a drive")
     print("== done")
     state = State(cfg["state_file"]).load()
-    if target == "missing":
-        # Absent, so btrfs could not scratch its superblock; see record_evicted
-        record_evicted(state, pool, losing)
-    else:
-        state.data["missing"].pop(str(target), None)
-        state.data["inventory"].pop(str(target), None)
+    # `remove missing` takes out one missing device however many there are, so look at
+    # which devids are gone rather than assuming. One that was absent could not have its
+    # superblock scratched; see record_evicted.
+    left = {d.devid for d in pool.devices()}
+    removed = [d for d in losing if d.devid not in left]
+    record_evicted(state, pool, [d for d in removed if not d.present])
+    for d in removed:
+        state.data["missing"].pop(str(d.devid), None)
+        state.data["inventory"].pop(str(d.devid), None)
     state.save()
     print(render_status(collect(pool), cfg, state))
 
@@ -1266,9 +1303,10 @@ def cmd_wipe_stale(cfg, args):
     pool.forget(dev)
     run(["wipefs", "-a", dev], capture=False)
     state = State(cfg["state_file"]).load()
-    state.data["evicted"] = [e for e in state.data.get("evicted") or []
-                             if not (e.get("fsid") == s["fsid"] and e.get("devid") == s["devid"]
-                                     and (e.get("generation") or 0) > s["generation"])]
+    # Only this drive's record. Another drive evicted later under the same (reused) devid
+    # has its own, and still needs it.
+    rec = s.get("record")
+    state.data["evicted"] = [e for e in state.data.get("evicted") or [] if e != rec]
     state.clear_notify(f"stale-{s['path']}")
     state.save()
     print("== done")
@@ -1607,6 +1645,18 @@ def describe(dev, state):
 EVICTED_KEEP = 32
 
 
+def eviction_record(evicted, sb):
+    """The record of the eviction that left this superblock behind, or None. A record is
+    written at the pool's generation right after the eviction, so the drive it is about is
+    older than it; btrfs reuses devids, so of the records for this devid the matching one
+    is the earliest that is newer than the drive. A serial on both sides must agree."""
+    cands = [e for e in evicted
+             if e.get("fsid") == sb["fsid"] and e.get("devid") == sb["devid"]
+             and sb["generation"] < (e.get("generation") or 0)
+             and (not e.get("serial") or not sb.get("serial") or e["serial"] == sb["serial"])]
+    return min(cands, key=lambda e: e["generation"]) if cands else None
+
+
 def record_evicted(state, pool, gone):
     """Remember drives evicted while absent. btrfs could not scratch their superblock, so
     if one is attached again it still claims to be devid N of this pool; the record is
@@ -1643,18 +1693,22 @@ def ensure_mounted(cfg, pool, notifier, state, degraded=True):
     succeeds as the last member returns."""
     if pool.is_mounted():
         return True
-    present = pool.member_devices_present()
-    stale = {s["path"] for s in pool.stale_members()} if present else set()
-    present = [p for p in present if p not in stale]
+    scan = pool.scan_members()
+    _, members, stale = scan
+    present = [m["path"] for m in members]
     if not present:
+        for s in stale:
+            # Registered, it would skew `btrfs device ready` once the real members arrive
+            pool.forget(s["path"])
         if state.should_notify("no-members", cfg["remind_interval_sec"]):
             notifier.send("No pool drives are visible",
-                          f"{cfg['mountpoint']} is not mounted and no btrfs member with "
-                          f"LABEL={cfg['label']} can be found.\nCheck the USB hub and power.")
+                          f"{cfg['mountpoint']} is not mounted and no member of the pool "
+                          f"(LABEL={cfg['label']}) can be found.\nCheck the cables and power."
+                          + "".join("\n" + stale_line(s) for s in stale))
         return False
-    complete, devids, expected = pool.members_complete()
+    complete, devids, expected = pool.members_complete(scan)
     if complete:
-        p = pool.mount(check=False)
+        p = pool.mount(check=False, scan=scan)
         if p.returncode == 0:
             LOG.info("mounted normally")
             state.clear_notify("no-members")
@@ -1671,7 +1725,7 @@ def ensure_mounted(cfg, pool, notifier, state, degraded=True):
         LOG.info("%s; not trying degraded from this pass", why)
         return False
     LOG.warning("%s — trying degraded", why)
-    p = pool.mount(degraded=True, check=False)
+    p = pool.mount(degraded=True, check=False, scan=scan)
     if p.returncode != 0:
         if state.should_notify("mount-failed", cfg["remind_interval_sec"]):
             notifier.send("Cannot mount the pool",
@@ -1800,7 +1854,8 @@ def rebuild_missing(cfg, pool, notifier, state, report):
                       f"{e}\n\nThe pool is still running, degraded. It needs attention:\n"
                       f"  sudo braidctl status\n  sudo btrfs device remove missing {cfg['mountpoint']}")
         return
-    record_evicted(state, pool, gone)
+    left = {d.devid for d in pool.devices()}
+    record_evicted(state, pool, [d for d in gone if d.devid not in left])
     state.data["rebuild"] = None
     state.save()
     new = collect(pool)

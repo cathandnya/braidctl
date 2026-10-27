@@ -132,6 +132,7 @@ sudo braidctl balance             # spread the data evenly over every drive (hou
 sudo braidctl remove 3            # remove devid 3 — only if what's left can still hold the data
 sudo braidctl remove /dev/sdg     # by path
 sudo braidctl remove missing      # evict a dead drive by hand (what monitor does for you)
+sudo braidctl wipe-stale /dev/sdX # erase a drive that was evicted while absent
 sudo braidctl monitor             # one detection pass; run from the timer every 5 minutes
 sudo braidctl scrub               # verify every block against its checksum
 sudo braidctl scrub --ack         # record the last result as reviewed (refused for real damage)
@@ -176,7 +177,8 @@ What is worth knowing before putting it anywhere:
   authenticates, a host whose clients can ssh in anyway — where a token adds a step and
   no protection. Cross-origin and Host checks apply either way
 - `read_only = true` refuses every mutating route at the dispatcher
-- `allow_force_add` — `wipefs`, the one irreversible operation — is off unless you turn it on
+- `allow_force_add` — `wipefs`, the one irreversible operation (`add --force`, `wipe-stale`) —
+  is off unless you turn it on
 - `allowed_hosts` is a Host-header allowlist (DNS rebinding); any name a browser uses has
   to be in it or the request is refused
 - `allow_from` restricts source addresses. Behind a proxy it sees the proxy, not the
@@ -222,9 +224,9 @@ balance leaves the pool protected, just less evenly filled. What the monitor is 
 re-protect the pool, and a balance converting chunks back to raid1, are shown with the
 reason they cannot be stopped.
 
-`add --force` runs `wipefs` and is the one irreversible operation in the tool, so it is
-not reachable from a browser unless `[web] allow_force_add = true`, and even then only
-after typing back the drive's serial.
+`add --force` and `wipe-stale` run `wipefs`, the one irreversible operation in the tool, so
+they are not reachable from a browser unless `[web] allow_force_add = true`, and even then
+only after typing back the drive's serial.
 
 **The pool does not depend on it.** Detection, re-protection and the boot mount are
 timers and udev rules that never call into it. It is socket-activated, so between visits
@@ -275,8 +277,13 @@ Destroying an array by mistyping a device node is a real risk for a tool like th
   signature or partitions.
 - **`remove` refuses** if the remaining drives couldn't hold the data, and says how much to add.
 - **A returning drive is never silently re-added.** If it still belongs to the pool it is
-  re-attached and resynced; if it was already evicted, you get a note suggesting `add --force`,
-  and nothing is touched.
+  re-attached and resynced; if it was already evicted, you get a note suggesting `wipe-stale`
+  or `add --force`, and nothing is touched.
+- **An evicted drive is not counted as a member.** A drive evicted while it was absent keeps
+  the pool's superblock — btrfs can only scratch one it can write to. Membership is decided by
+  the filesystem's own device list, not by label and fsid, so such a drive neither pushes the
+  pool into a degraded mount nor makes a missing member look present. `status` lists it as a
+  stale member until it is erased.
 - **The mount point is immutable.** `chattr +i /srv/pool` means that if the pool is *not* mounted,
   writes to that path fail instead of quietly filling your root filesystem — a classic way to lose
   a NAS's data to a full `/`.

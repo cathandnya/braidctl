@@ -130,6 +130,7 @@ sudo braidctl balance             # データを全ドライブに均等に並�
 sudo braidctl remove 3            # devid 3 を外す。残りに収まる場合のみ
 sudo braidctl remove /dev/sdg     # パス指定でも可
 sudo braidctl remove missing      # 死んだドライブを手で外す (monitor が自動でやるのと同じ)
+sudo braidctl wipe-stale /dev/sdX # 不在のまま外したドライブを消去する
 sudo braidctl monitor             # 検知を 1 回。timer から 5 分毎に呼ばれる
 sudo braidctl scrub               # 全ブロックをチェックサムと照合
 sudo braidctl scrub --ack         # 直近の結果を確認済みとして記録 (本物の破損には使えない)
@@ -172,7 +173,7 @@ braidctl が話すのは平文の HTTP、これからもそう（証明書の管
   （1 台に固定した tailnet、認証するプロキシ、そのクライアントがどうせ ssh で入れるホスト）、
   トークンは手順を 1 つ増やすだけで何も守らない。越境要求と Host の検査はどちらでも効く
 - `read_only = true` は全 mutation をディスパッチャの段階で拒否する
-- `allow_force_add`（`wipefs`、唯一の不可逆操作）は、自分で有効にしない限り off
+- `allow_force_add`（`wipefs`、唯一の不可逆操作。`add --force` と `wipe-stale`）は、自分で有効にしない限り off
 - `allowed_hosts` は Host ヘッダの許可リスト（DNS rebinding 対策）。ブラウザが使う名前は
   ここに無いと拒否される
 - `allow_from` は接続元の制限。プロキシの後ろではプロキシのアドレスが見える（`X-Forwarded-For`
@@ -216,7 +217,7 @@ remove — は「Running」に並び、キャンセルボタンが `braidctl can
 残るだけ）。monitor による再冗長化と、raid1 へ戻す convert の balance は、止められない理由と
 一緒に表示される。
 
-`add --force` は `wipefs` を実行する唯一の不可逆操作なので、`[web] allow_force_add = true`
+`add --force` と `wipe-stale` は `wipefs` を実行する唯一の不可逆操作なので、`[web] allow_force_add = true`
 を書かない限りブラウザからは届かない。書いた場合でも、そのドライブのシリアルを打ち込まないと
 実行されない。
 
@@ -268,7 +269,12 @@ btrfs のドライブごとのエラーカウンタ（`btrfs device stats`）は
   パーティションを持つもの
 - **`remove` が拒否する条件**: 残りのドライブに収まらないとき。あと何 GB 必要かを表示する
 - **戻ってきたドライブを黙って組み込まない。** まだプールのメンバーなら組み戻して再同期する。
-  既に外した後のものなら `add --force` を勧める通知を出すだけで、何も触らない
+  既に外した後のものなら `wipe-stale` か `add --force` を勧める通知を出すだけで、何も触らない
+- **外したドライブをメンバーとして数えない。** 不在のまま外したドライブには、プールの
+  スーパーブロックが残る（btrfs が消せるのは書き込めるデバイスのものだけ）。メンバーかどうかは
+  ラベルと fsid ではなくファイルシステム自身のデバイス一覧で判定するので、そのドライブのせいで
+  degraded マウントになったり、欠けたメンバーが揃って見えたりはしない。消去するまで `status` に
+  stale member として表示される
 - **マウントポイントは immutable。** `chattr +i /srv/pool` により、プールが*マウントされていない*とき
   そのパスへの書き込みは失敗する。黙ってルートファイルシステムを埋め尽くす — NAS のデータを
   `/` の枯渇で失う古典的な失敗 — を防ぐ

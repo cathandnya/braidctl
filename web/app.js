@@ -35,7 +35,7 @@
   }
 
   function banner(level, text) {
-    $('banners').appendChild(el('p', 'banner ' + level, text));
+    return $('banners').appendChild(el('p', 'banner ' + level, text));
   }
 
   const STATE_LEVEL = {
@@ -75,6 +75,7 @@
         + (d.error ? ` — ${d.error}` : ''));
     }
     if (d.note) banner('fail', d.note);
+    renderStale(d);
 
     const u = d.usage;
     $('usable').textContent = u ? bytes(u.usable) : '—';
@@ -210,6 +211,38 @@
   // scrub timer, a balance, someone at a terminal. Whether each
   // can be stopped is the server's call, from the same check `braidctl cancel` makes.
   let stopping = null;           // the kind whose cancel request is still in flight
+
+  // A drive evicted while it was absent still carries the pool's superblock. braidctl no
+  // longer counts it, but it is worth saying so: it looks like a member to anything else.
+  function renderStale(d) {
+    const cfg = d.config || {};
+    for (const s of d.stale_members || []) {
+      const what = [s.model, s.serial && `serial ${s.serial}`].filter(Boolean).join(', ');
+      const p = banner('warn', `${s.path}${what ? ` (${what})` : ''} was devid ${s.devid} of this pool`
+        + (s.evicted_at ? `, evicted ${new Date(s.evicted_at * 1000).toLocaleDateString()}` : '')
+        + ' — it is not a member, but still carries the pool\'s signature. Erase it before reusing it.');
+      if (cfg.read_only || busy(d)) continue;
+      if (!cfg.allow_force_add) {
+        p.appendChild(el('div', 'why',
+          'erasing it from here needs [web] allow_force_add = true; or run `sudo braidctl wipe-stale ' + s.path + '`'));
+        continue;
+      }
+      const b = el('button', null, 'Erase…');
+      b.addEventListener('click', () => {
+        // the same string the server compares against (check_wipe_confirmation)
+        const want = s.serial || `WIPE ${s.model || s.path.split('/').pop()} ${s.size}`;
+        const typed = window.prompt(`This ERASES ${s.path}. Type exactly:\n${want}`);
+        if (typed === null) return;
+        askConfirm({ action: 'wipe-stale', device: s.path, confirm: typed, confirm_wipe: 'ERASE' },
+          `braidctl wipe-stale ${s.path}`,
+          'wipefs erases the old pool signature. What was on the drive is gone, and this cannot be undone.');
+      });
+      p.appendChild(document.createTextNode(' '));
+      p.appendChild(b);
+    }
+  }
+
+  function busy(d) { return !!(d.lock && d.lock.held); }
 
   function renderOperations(d) {
     const ops = d.operations || [];

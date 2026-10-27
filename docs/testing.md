@@ -59,7 +59,10 @@ sudo braidctl $C monitor                              # remounts to re-attach it
 ```
 
 Once a drive has actually been evicted, reattaching it produces a note that it is a stale member and
-no action — `braidctl $C add --force /dev/loopN` puts it back.
+no action — `braidctl $C add --force /dev/loopN` puts it back, `braidctl $C wipe-stale /dev/loopN`
+erases it. Unmount the pool with the stale drive still attached and `braidctl $C mount` must mount
+it normally (no `degraded` in `findmnt -no OPTIONS`); detach a real member as well and it must not
+attempt a normal mount.
 
 ### Refusals
 

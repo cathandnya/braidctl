@@ -69,6 +69,7 @@ def pool(devices, **kw):
                     "chunks_total": None, "text": ""},
         "removable": {str(d["devid"]): {"ok": True} for d in devices},
         "operations": [], "lock": {"held": False, "pid": None, "cmdline": None},
+        "stale_members": [],
         "smart_at": now - 120, "source": "live", "age_sec": 0,
         "config": {"debounce_sec": 600, "warn_percent": 90, "rebuild_margin": 0.95,
                    "chunk_headroom_warn": 16 * GiB, "chunk_headroom_fail": 2 * GiB,
@@ -150,7 +151,19 @@ def busy():
                            for d in devs})
 
 
-SCENARIOS = {"healthy": healthy, "errors": errors, "degraded": degraded, "full": full, "busy": busy}
+def stale():
+    """A drive evicted while absent attached again: not a member, still carries the signature."""
+    snap = pool(base_drives(), stale_members=[
+        {"path": "/dev/sdf", "fsid": "4e1c0a2b-0000-4000-8000-000000000000", "devid": 4,
+         "uuid": "9bdcb257-0000-4000-8000-000000000000", "generation": 17188, "num_devices": 6,
+         "serial": "WD-WCC4M1234567", "model": "WDC WD10EZEX-08WN4A0", "size": 1 * TB,
+         "evicted_at": int(time.time()) - 21 * 86400}])
+    snap["config"]["allow_force_add"] = True
+    return snap
+
+
+SCENARIOS = {"healthy": healthy, "errors": errors, "degraded": degraded, "full": full, "busy": busy,
+             "stale": stale}
 
 CANDIDATES = {"busy": None, "allow_force_add": False, "candidates": [
     {"path": "/dev/sdh", "model": "Samsung SSD 860", "serial": "S3Z8NB0K", "size": 1 * TB,

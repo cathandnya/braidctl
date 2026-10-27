@@ -101,6 +101,11 @@ Each pass:
    filesystem thinks is missing is a drive that came back. Remount to pick it up, then start a
    scrub so the copies it missed while absent are rewritten. A device with the right fsid but a
    devid the filesystem no longer knows is an *evicted* member — report it, touch nothing.
+   Membership, here and when deciding whether a normal mount can succeed, comes from the chunk
+   tree's device items (devid and device uuid) as read through the newest superblock, not from
+   label and fsid: a drive evicted while absent keeps both, and counted as a member it made the
+   pool mount degraded with nothing missing. Evictions are also recorded in `state.json` with the
+   pool's generation, which decides when the device list cannot be read.
 3. **Record losses.** New missing devices get a timestamp and an immediate notification. Devices
    that reappeared get their timestamp cleared.
 4. **Check health.** Rising btrfs error counters and SMART degradation are reported, rate limited to

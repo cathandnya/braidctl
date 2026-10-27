@@ -217,9 +217,9 @@ class PoolView:
         lock_path = Path(cfg["state_file"]).with_suffix(".lock")
         holder = core.lock_holder(lock_path)
         if not pool.is_mounted():
-            present = pool.member_devices_present()
-            note = f"{cfg['mountpoint']} is not mounted. Members visible: {', '.join(present) or 'none'}"
-            snap = core.snapshot_dict(cfg, pool, None, state, note=note)
+            snap = core.snapshot_dict(cfg, pool, None, state)
+            snap["note"] = (f"{cfg['mountpoint']} is not mounted. "
+                            f"Members visible: {', '.join(snap['members_visible']) or 'none'}")
         else:
             report = core.collect(pool, smart=False)
             for d in report.devs:
@@ -237,7 +237,9 @@ class PoolView:
                           # machine's thresholds rather than a copy of the defaults
                           "chunk_headroom_warn": cfg["chunk_headroom_warn"],
                           "chunk_headroom_fail": cfg["chunk_headroom_fail"],
-                          "read_only": self.web["read_only"], "mountpoint": cfg["mountpoint"]}
+                          "read_only": self.web["read_only"], "mountpoint": cfg["mountpoint"],
+                          # also what lets the page offer wipe-stale
+                          "allow_force_add": bool(self.web.get("allow_force_add"))}
         snap["smart_at"] = int(self.smart_at) if getattr(self, "smart_at", 0) else None
         return snap
 
@@ -827,6 +829,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "remove":         {"label": "remove a drive"},
         "mount":          {"label": "mount", "gate": "allow_mount_actions"},
         "mount-degraded": {"label": "mount degraded", "gate": "allow_mount_actions"},
+        # wipefs, like add --force, so behind the same switch
+        "wipe-stale":     {"label": "erase a stale drive", "gate": "allow_force_add"},
     }
 
     def build_argv(self, action, body):
@@ -864,12 +868,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                            "force": True}
                 raise ValueError(c["reason"])
             raise ValueError("no such addable device")
+        if action == "wipe-stale":
+            want = os.path.realpath(str(body.get("device") or ""))
+            for st in pool.scan_members()[2]:
+                if os.path.realpath(st["path"]) != want:
+                    continue
+                cand = {"path": st["path"], "model": st.get("model") or "",
+                        "serial": st.get("serial") or "", "size": st.get("size")}
+                self.check_wipe_confirmation(cand, body)
+                return ["wipe-stale", st["path"]], {"device": st["path"], "was_devid": st["devid"],
+                                                     "model": cand["model"], "serial": cand["serial"],
+                                                     "size": cand["size"]}
+            raise ValueError("no such stale drive")
         raise ValueError(f"unknown action {action!r}")
 
     def check_wipe_confirmation(self, cand, body):
-        """`add --force` runs wipefs. It is the only irreversible thing in the tool, so it
-        is off unless braid.toml says otherwise, and even then the operator has to type
-        back what the server just read from the drive."""
+        """`add --force` and `wipe-stale` run wipefs, the only irreversible thing in the tool,
+        so they are off unless braid.toml says otherwise, and even then the operator has to
+        type back what the server just read from the drive."""
         # A drive behind a USB bridge often reports no serial, and a loop device reports
         # neither, so fall back to something the operator can actually read off the page.
         want = cand["serial"] or f"WIPE {cand['model'] or os.path.basename(cand['path'])} {cand['size']}"
@@ -1056,14 +1072,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             pool = core.Pool(cfg)
             if not pool.is_mounted():
-                return f"{cfg['mountpoint']} is not mounted\n"
+                return (f"{cfg['mountpoint']} is not mounted\n"
+                        + "".join(core.stale_line(st) + "\n" for st in pool.scan_members()[2]))
             state = core.State(cfg["state_file"]).load()
             report = core.collect(pool, smart=False)
             for d in report.devs:
                 d.smart = self.ctx["view"].smart.get(d.devid, {})
             return core.render_status(report, cfg, state,
                                       core.scrub_info(pool, state, report),
-                                      pool.balance_status()) + "\n"
+                                      pool.balance_status(),
+                                      stale=pool.stale_members(report)) + "\n"
         except Exception as e:
             return f"error: {e}\n"
 

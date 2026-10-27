@@ -56,7 +56,8 @@ decline: a drive that is the system disk, mounted, held by LUKS/LVM, matching
 remove that would not leave room for the data is shown disabled with the shortfall.
 
 `add --force` — the one irreversible operation, since it runs `wipefs` — is not reachable
-from the browser unless `[web] allow_force_add = true`, and even then it asks you to type
+from the browser unless `[web] allow_force_add = true` (the same switch offers `wipe-stale` on
+a stale member's banner), and even then it asks you to type
 back the drive's serial (or model and size) before it will run. The recommended way to
 admit a used disk is still a terminal:
 
@@ -166,8 +167,15 @@ Plug it in. The next monitor pass re-attaches it and starts a scrub to rewrite w
 while it was away. Nothing to type.
 
 If it had already been evicted — you got the "re-protected" email, and only then plugged it back in
-— it is no longer a member. `status` will not show it, and the monitor will send a one-off note
-saying so. To reuse it: `sudo braidctl add --force /dev/sdX`.
+— it is no longer a member. It still carries the pool's superblock: btrfs evicted it while it was
+absent and could not scratch it. braidctl goes by the filesystem's own device list, so it is not
+counted, the pool mounts normally, and `status` shows a `Stale member:` line for it; the monitor
+sends a one-off note naming it. Erase it before using it for anything else:
+
+```bash
+sudo braidctl wipe-stale /dev/sdX     # refuses anything that is not a stale member of this pool
+sudo braidctl add --force /dev/sdX    # or put it back in the pool
+```
 
 ## Boot with a drive missing
 

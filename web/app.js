@@ -90,10 +90,8 @@
 
     // btrfs's own sentence, rendered rather than paraphrased: it carries the arithmetic
     // that justifies the colour.
-    // 'info' is advice, not a problem (e.g. "losing the largest drive would leave too little
-    // to re-protect"); `braidctl status` still prints it, the page stays quiet.
     if (d.verdict) {
-      $('verdict').textContent = d.verdict.level === 'info' ? '' : d.verdict.text;
+      $('verdict').textContent = d.verdict.text;
       $('verdict').style.color = d.verdict.level === 'fail' ? 'var(--fail)'
         : d.verdict.level === 'warn' ? 'var(--warn)' : '';
     }

@@ -207,7 +207,7 @@
   }
 
   // What is running on the pool, however it was started: a job from this page, the
-  // scrub timer, the balance an add leaves behind, someone at a terminal. Whether each
+  // scrub timer, a balance, someone at a terminal. Whether each
   // can be stopped is the server's call, from the same check `braidctl cancel` makes.
   let stopping = null;           // the kind whose cancel request is still in flight
 
@@ -247,6 +247,8 @@
   const COMMANDS = {
     scrub: { cmd: 'braidctl scrub',
              note: 'Reads every block and checks it against its checksum. Takes hours and uses every drive at once.' },
+    balance: { cmd: 'braidctl balance',
+               note: 'Rewrites every chunk so the data is spread evenly over all the drives — what an uneven row of bars is for. Takes hours; the pool stays usable and protected, and it can be cancelled.' },
     monitor: { cmd: 'braidctl monitor',
                note: 'One detection pass, the same one the five-minute timer runs.' },
     mount: { cmd: 'braidctl mount', note: 'Mount the pool, waiting for drives to appear.' },
@@ -362,7 +364,7 @@
         const b = el('button', null, 'Add');
         b.addEventListener('click', () => askConfirm({ action: 'add', device: c.path },
           `braidctl add ${c.path}`,
-          `${c.model || ''} ${bytes(c.size)}. A full balance starts afterwards; the pool stays usable.`));
+          `${c.model || ''} ${bytes(c.size)}. Existing data stays where it is and new writes go to it first; Balance now spreads the rest.`));
         row.appendChild(b);
       } else if (c.status === 'needs_force') {
         const b = el('button', null, 'Erase and add…');
@@ -402,9 +404,8 @@
     bar.style.width = (p.pct !== null && p.pct !== undefined ? Math.min(100, p.pct) : 0) + '%';
     $('job-detail').textContent = [p.phase, p.pct !== null && p.pct !== undefined ? p.pct + '%' : null,
       p.detail, p.time_left ? p.time_left + ' left' : null].filter(Boolean).join(' · ');
-    // Cancel only where cancelling means anything: a scrub or a device remove. add,
-    // monitor and mount are over in seconds; the balance an add starts is listed under
-    // Running once the add has finished.
+    // Cancel only where cancelling means anything: a scrub, a balance or a device remove.
+    // add, monitor and mount are over in seconds.
     const cancel = $('job-cancel');
     cancel.hidden = !(job.cancellable && job.state === 'running');
     cancel.disabled = !!job.cancel_requested;

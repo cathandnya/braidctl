@@ -307,10 +307,9 @@ class PoolView:
 JOB_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{12}$")
 BRAIDCTL = "/usr/local/sbin/braidctl"
 # What `braidctl cancel` can stop, and which of those each job action is. add, monitor
-# and mount finish in seconds; the balance an add starts outlives its job and is stopped
-# as a balance.
+# and mount finish in seconds; a balance job lasts as long as its balance.
 CANCEL_KINDS = ("scrub", "balance", "remove")
-JOB_CANCELS = {"scrub": "scrub", "remove": "remove"}
+JOB_CANCELS = {"scrub": "scrub", "balance": "balance", "remove": "remove"}
 
 
 def new_job_id():
@@ -822,6 +821,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # that is not an element of a set we enumerated ourselves never reaches argv.
     ACTIONS = {
         "scrub":          {"label": "scrub"},
+        "balance":        {"label": "balance"},
         "monitor":        {"label": "monitor pass"},
         "add":            {"label": "add a drive"},
         "remove":         {"label": "remove a drive"},
@@ -834,7 +834,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         `/dev/sda; rm -rf /` is not an element of any of these sets, so it cannot reach
         argv — a stronger property than any amount of quoting, and easier to review."""
         core, cfg = self.ctx["core"], self.ctx["cfg"]
-        if action in ("scrub", "monitor", "mount", "mount-degraded"):
+        if action in ("scrub", "balance", "monitor", "mount", "mount-degraded"):
             return [action], {}
         pool = core.Pool(cfg)
         if action == "remove":
@@ -961,6 +961,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if pool.balance_running():
                     raise core.BraidError("a balance is running (rebuild or rebalance); "
                                           "scrub once it finishes")
+            if action == "balance":
+                if not pool.is_mounted():
+                    raise core.BraidError(f"{cfg['mountpoint']} is not mounted")
+                if pool.balance_running():
+                    raise core.BraidError("a balance is already running")
+                if "running" in pool.scrub_status():
+                    raise core.BraidError("a scrub is running; balance once it finishes")
             if action in ("add", "remove"):
                 if not pool.is_mounted():
                     raise core.BraidError(f"{cfg['mountpoint']} is not mounted")

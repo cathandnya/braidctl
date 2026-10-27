@@ -180,7 +180,7 @@ class Mock:
             job = {"version": 1, "id": time.strftime("%Y%m%dT%H%M%S") + "-0123456789ab",
                    "action": action, "params": {}, "state": "running", "created": now,
                    "started": now, "finished": None, "exit": None, "error": None,
-                   "cancellable": action in ("scrub", "remove"), "cancel_requested": False,
+                   "cancellable": action in ("scrub", "balance", "remove"), "cancel_requested": False,
                    "progress": {"phase": "starting", "pct": 0, "detail": "", "updated": now},
                    "log": "", "requested_by": {"addr": "mock"}}
             self.jobs.insert(0, job)
@@ -230,7 +230,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self.send_obj(mock.status())
         if path == "/api/jobs":
             return self.send_obj({"jobs": mock.jobs[:20], "read_only": False,
-                                  "actions": ["add", "monitor", "mount", "remove", "scrub"]})
+                                  "actions": ["add", "balance", "monitor", "mount", "remove", "scrub"]})
         if re.match(r"^/api/jobs/[^/]+/log$", path):
             return self.send_obj({"offset": 0, "next": 0, "text": "", "eof": True})
         m = re.match(r"^/api/jobs/([^/]+)$", path)

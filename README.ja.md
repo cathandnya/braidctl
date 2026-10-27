@@ -125,7 +125,8 @@ sudo braidctl status
 ```bash
 sudo braidctl status              # 容量、保護状態、各ドライブの健康
 sudo braidctl status --json       # 同じ内容を機械可読で
-sudo braidctl add /dev/sdX        # 追加 (中身があれば --force が要る) して balance
+sudo braidctl add /dev/sdX        # 追加 (中身があれば --force が要る)。データは動かさない
+sudo braidctl balance             # データを全ドライブに均等に並べ直す (数時間、止められる)
 sudo braidctl remove 3            # devid 3 を外す。残りに収まる場合のみ
 sudo braidctl remove /dev/sdg     # パス指定でも可
 sudo braidctl remove missing      # 死んだドライブを手で外す (monitor が自動でやるのと同じ)
@@ -204,12 +205,12 @@ read_only = true
 あるいはループバックのままにして、その機械にいつも使っている経路で見る:
 `ssh -L 8765:127.0.0.1:8765 nas`。
 
-画面からできるのは scrub、monitor の実行、ドライブの追加と取り外し、落ちているときのマウント。
+画面からできるのは scrub、balance、monitor の実行、ドライブの追加と取り外し、落ちているときのマウント。
 どのボタンも**実行するコマンドをそのまま見せて**から動く。実際の処理はリクエストの中ではなく
 transient な systemd ユニットとして走るので、数時間かかる remove もページを閉じて構わない。
 拒否はすべて CLI 自身の判断で、CLI が断るドライブは理由付きで並ぶだけでボタンが出ない。
 
-プール上で実行中のもの — タイマーの scrub、`add` の後に残る balance、画面や端末から始めた
+プール上で実行中のもの — タイマーの scrub、balance、画面や端末から始めた
 remove — は「Running」に並び、キャンセルボタンが `braidctl cancel` を実行する。remove を
 止めてもドライブはプールに残り、balance を止めてもプールは保護されたまま（空きの偏りが
 残るだけ）。monitor による再冗長化と、raid1 へ戻す convert の balance は、止められない理由と

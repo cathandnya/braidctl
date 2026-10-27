@@ -127,7 +127,8 @@ label, or the services to pause during a rebuild differ from the defaults.
 ```bash
 sudo braidctl status              # capacity, protection state, per-drive health
 sudo braidctl status --json       # same, for scripts
-sudo braidctl add /dev/sdX        # add a drive (refuses one with data unless --force), then balance
+sudo braidctl add /dev/sdX        # add a drive (refuses one with data unless --force); moves no data
+sudo braidctl balance             # spread the data evenly over every drive (hours; cancellable)
 sudo braidctl remove 3            # remove devid 3 — only if what's left can still hold the data
 sudo braidctl remove /dev/sdg     # by path
 sudo braidctl remove missing      # evict a dead drive by hand (what monitor does for you)
@@ -208,14 +209,14 @@ read_only = true
 Or leave it on loopback and reach it the way you already reach the machine:
 `ssh -L 8765:127.0.0.1:8765 nas`.
 
-From the page you can start a scrub or a monitor pass, add or remove a drive, and mount
+From the page you can start a scrub, a balance or a monitor pass, add or remove a drive, and mount
 the pool when it is down. Each button shows the exact command first, and the work runs as
 a transient systemd unit rather than inside the request, so a remove that takes hours
 survives the page being closed. Every refusal is the CLI's own: a drive the CLI would
 decline is listed with that reason and no button.
 
-Whatever is running on the pool — a scrub from the timer, the balance an `add` leaves
-behind, a remove started from the page or a terminal — is listed with a Cancel button
+Whatever is running on the pool — a scrub from the timer, a balance, a remove started
+from the page or a terminal — is listed with a Cancel button
 that runs `braidctl cancel`. A cancelled remove leaves the drive in the pool; a cancelled
 balance leaves the pool protected, just less evenly filled. What the monitor is doing to
 re-protect the pool, and a balance converting chunks back to raid1, are shown with the

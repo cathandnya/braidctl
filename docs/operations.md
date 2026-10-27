@@ -65,7 +65,7 @@ sudo braidctl add --force /dev/sdX     # while looking at lsblk
 ```
 
 Anything long-running on the pool is listed under Running with a Cancel button, whoever
-started it — a job from the page, the scrub timer, the balance `add` leaves behind, someone
+started it — a job from the page, the scrub timer, a balance, someone
 at a terminal. The button runs `braidctl cancel scrub|balance|remove`, which is the same
 thing from a shell, and it runs inside the request (it returns in seconds) rather than as a
 job, because the job slot is held by the thing being stopped.
@@ -109,9 +109,18 @@ sudo braidctl add /dev/sdX
 point — it is the last thing standing between a typo and somebody's other disk. If the drive really
 is scrap, repeat with `--force`, which wipes signatures before adding.
 
-A background balance starts automatically to spread existing data onto the new drive. Usable
-capacity rises immediately; the physical redistribution takes as long as it takes. `status` reports
-`REBUILDING` while it runs. The pool is fully usable throughout.
+`add` moves no data. Usable capacity rises immediately, and new chunks go to the drives with the
+most unallocated space, so the new drive takes new writes first. To spread what is already there
+over every drive, run a balance when the hours of I/O suit you:
+
+```bash
+sudo braidctl balance             # or Balance now on the page; `braidctl cancel balance` stops it
+```
+
+`status` reports `REBUILDING` while it runs. The pool is fully usable and protected throughout, and a
+cancelled balance leaves it that way, just less evenly filled. Before this, `add` started the
+balance itself in the background; from the web view that balance was killed along with the job
+seconds later, so the two ways of adding behaved differently.
 
 ## Removing a drive on purpose
 

@@ -3,7 +3,8 @@
 braidctl — Drobo BeyondRAID-style pool management on top of btrfs raid1.
 
   status [--json]      raw / usable / used capacity, protection state, per-drive health
-  add DEV [--force]    add a drive and rebalance (refuses a drive that carries data)
+  add DEV [--force]    add a drive (refuses a drive that carries data); moves no data
+  balance              spread the data evenly over every drive (a full balance, hours)
   remove ID|DEV        remove a drive safely (only if what remains can still hold the data)
   monitor              run from a timer: detect losses and failures, re-protect automatically
   scrub                verify every block against its checksum (monthly timer)
@@ -1006,15 +1007,45 @@ def cmd_add(cfg, args):
         run(["wipefs", "-a", dev])
     print(f"== adding {dev}")
     run(["btrfs", "device", "add", "-f", dev, cfg["mountpoint"]], capture=False)
-    print("== starting background balance to spread data onto it")
-    run(["btrfs", "balance", "start", "--bg", "--full-balance", cfg["mountpoint"]], check=False, capture=False)
-    time.sleep(2)
     after = pool.usage()
-    print(f"usable capacity: {fmt_bytes(before.usable)} -> {fmt_bytes(after.usable)} "
-          f"(final once the balance completes)")
+    print(f"usable capacity: {fmt_bytes(before.usable)} -> {fmt_bytes(after.usable)}")
+    # No balance. It used to start one in the background, which from the web view was
+    # killed with the job's cgroup seconds later, so a page add never balanced and a
+    # terminal add always did. New chunks go to the drives with the most unallocated
+    # space, so the new drive fills first without one; spreading what is already there
+    # is `braidctl balance`, started when somebody decides the hours of I/O are worth it.
+    print("existing data stays where it is; new writes go to the emptiest drives first.\n"
+          "`braidctl balance` spreads the existing data over every drive (hours, the pool stays usable)")
     st = State(cfg["state_file"]).load()
     update_inventory(st, pool.devices())
     st.save()
+
+
+def cmd_balance(cfg, args):
+    """A full balance, in the foreground: the job the web view runs it as lasts as long as
+    the balance does, so its progress and its Cancel are the job's.
+
+    The pool lock is not taken, for the reason scrub does not take it: a balance runs for
+    hours, and holding the lock that long would hold off loss detection. add and remove
+    refuse while it runs, and the monitor waits for it before re-protecting."""
+    require_root()
+    pool = Pool(cfg)
+    if not pool.is_mounted():
+        raise BraidError(f"{cfg['mountpoint']} is not mounted")
+    if pool.balance_running():
+        raise BraidError("a balance is already running")
+    if "running" in pool.scrub_status():
+        raise BraidError("a scrub is running; balance once it finishes")
+    holder = lock_holder(Path(cfg["state_file"]).with_suffix(".lock"))
+    if holder:
+        raise BraidError(f"another braidctl is running: {holder['cmdline']}")
+    LOG.info("full balance starting")
+    print(f"== balancing {cfg['mountpoint']}: every chunk is rewritten, so this takes hours. "
+          "`braidctl cancel balance` stops it after the chunk it is moving")
+    p = run(["btrfs", "balance", "start", "--full-balance", cfg["mountpoint"]], check=False, capture=False)
+    if p.returncode != 0:
+        raise BraidError(f"btrfs balance exited {p.returncode} (cancelled, or see the output above)")
+    LOG.info("full balance finished")
 
 
 def resolve_target(pool, target):
@@ -2131,6 +2162,9 @@ def main(argv=None):
     s.add_argument("device")
     s.add_argument("--force", action="store_true", help="erase existing signatures and partitions first")
     s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("balance", help="spread the data evenly over every drive (hours)")
+    s.set_defaults(fn=cmd_balance)
 
     s = sub.add_parser("remove", help="remove a drive (devid, device path, or 'missing')")
     s.add_argument("target")

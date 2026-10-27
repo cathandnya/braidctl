@@ -1014,8 +1014,18 @@ def cmd_add(cfg, args):
     # terminal add always did. New chunks go to the drives with the most unallocated
     # space, so the new drive fills first without one; spreading what is already there
     # is `braidctl balance`, started when somebody decides the hours of I/O are worth it.
-    print("existing data stays where it is; new writes go to the emptiest drives first.\n"
-          "`braidctl balance` spreads the existing data over every drive (hours, the pool stays usable)")
+    #
+    # Except that the capacity above is arithmetic on drive sizes. A raid1 chunk needs
+    # unallocated space on two drives, so when the old ones are fully allocated the new
+    # drive alone cannot take one, and writes keep failing until a balance has run.
+    head = chunk_headroom(collect(pool, smart=False))
+    if head < cfg["chunk_headroom_warn"]:
+        print(f"!! only {fmt_bytes(head)} unallocated on the drive a new chunk must land on besides "
+              "the new one: a raid1 chunk needs room on two drives, so most of the new space cannot be "
+              "written to yet. Run `braidctl balance` to make it usable.")
+    else:
+        print("existing data stays where it is; new writes go to the emptiest drives first.\n"
+              "`braidctl balance` spreads the existing data over every drive (hours, the pool stays usable)")
     st = State(cfg["state_file"]).load()
     update_inventory(st, pool.devices())
     st.save()
@@ -1027,7 +1037,8 @@ def cmd_balance(cfg, args):
 
     The pool lock is not taken, for the reason scrub does not take it: a balance runs for
     hours, and holding the lock that long would hold off loss detection. add and remove
-    refuse while it runs, and the monitor waits for it before re-protecting."""
+    refuse while it runs, and the monitor cancels it when it has to re-protect the pool
+    (cancel_balance_for_rebuild)."""
     require_root()
     pool = Pool(cfg)
     if not pool.is_mounted():
@@ -1053,6 +1064,11 @@ def cmd_balance(cfg, args):
     if "canceled" in out or "cancelled" in out:
         LOG.warning("full balance cancelled; the chunks already moved stay where they are")
         return
+    if "paused" in out:
+        # Also what an unmount does to it. A paused balance still counts as running, so
+        # scrub, add, remove and the monitor's rebuild all keep waiting for it.
+        raise BraidError(f"the balance was paused, not finished: `btrfs balance resume {cfg['mountpoint']}` "
+                         "continues it, `braidctl cancel balance` drops it")
     LOG.info("full balance finished")
 
 
@@ -1502,6 +1518,30 @@ def cancel_scrub_for_rebuild(pool):
     return True
 
 
+def cancel_balance_for_rebuild(pool):
+    """Re-protecting the pool outranks spreading it evenly. Before `braidctl balance` a
+    full balance only ran briefly after an add; now it is something a person starts and
+    leaves running for hours, and a rebuild or an eviction that waits for it leaves the
+    pool on single copies, or a failing drive in it, for that long. A device remove cannot
+    run beside a balance at all (it is an exclusive operation).
+
+    Returns whether the way is clear. A convert is not cancelled: it is putting data that
+    was written single-copy back onto two drives, the thing a rebuild is for."""
+    bal = pool.balance_status()
+    if not (bal["running"] or bal["paused"]):
+        return True
+    if bal["converting"]:
+        LOG.info("a convert balance is running; re-protection waits for it")
+        return False
+    LOG.warning("cancelling the running balance (%s): re-protection needs the pool", bal.get("text") or "")
+    try:
+        run(["btrfs", "balance", "cancel", pool.mnt], check=False, timeout=900)
+    except BraidError as e:
+        LOG.warning("%s", e)
+        return False
+    return not pool.balance_running()
+
+
 RESYNC_UNIT = "braid-resync-scrub"
 
 
@@ -1749,17 +1789,18 @@ def cmd_monitor(cfg, args):
         # Failing but present: remove it live; unreadable parts come from the mirror
         d = failing[0]
         ok, after, needed = can_rebuild(report, cfg, losing=[d])
-        if ok:
+        if ok and cancel_balance_for_rebuild(pool):
             notifier.send("Evicting a failing drive automatically",
                           f"{describe(d, state)}\nUsable afterwards {fmt_bytes(after)}")
             p = pool.remove_device(d.devid)
             notifier.send("Automatic eviction " + ("complete" if p.returncode == 0 else "failed"),
                           (p.stderr or p.stdout or "") + "\n\n" + render_status(collect(pool), cfg, state))
-    elif expired and not report.balance_running:
+    elif expired:
         ok, after, needed = can_rebuild(report, cfg)
         if ok:
-            rebuild_missing(cfg, pool, notifier, state, report)
-            report = collect(pool)
+            if cancel_balance_for_rebuild(pool):
+                rebuild_missing(cfg, pool, notifier, state, report)
+                report = collect(pool)
         elif state.should_notify("cannot-rebuild", cfg["remind_interval_sec"]):
             short = needed / cfg["rebuild_margin"] - after
             notifier.send("Drive addition required (cannot re-protect)",

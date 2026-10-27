@@ -118,7 +118,12 @@ sudo braidctl balance             # or Balance now on the page; `braidctl cancel
 ```
 
 `status` reports `REBUILDING` while it runs. The pool is fully usable and protected throughout, and a
-cancelled balance leaves it that way, just less evenly filled. Before this, `add` started the
+cancelled balance leaves it that way, just less evenly filled. If a drive is lost (or fails SMART
+with `auto_evict_on_errors`) while it runs, the monitor cancels the balance and re-protects the pool;
+start it again afterwards.
+
+When the old drives are fully allocated, the new one alone cannot take a raid1 chunk (each needs
+room on two drives), so its space is not writable until a balance has run. `add` says so. Before this, `add` started the
 balance itself in the background; from the web view that balance was killed along with the job
 seconds later, so the two ways of adding behaved differently.
 

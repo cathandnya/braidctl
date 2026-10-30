@@ -90,8 +90,8 @@ DEFAULT_CONFIG = {
         "token_file": "/etc/braid/web-token",
         "session_ttl_sec": 604800,
         "cookie_secure": False,
-        # smartctl is slow behind a USB bridge and wakes sleeping drives, so the web
-        # view refreshes it on its own clock and never inside a request.
+        # smartctl takes seconds per drive behind a USB bridge, so the web view
+        # refreshes it on its own clock and never inside a request.
         "smart_ttl_sec": 900,
         "btrfs_ttl_sec": 3,
         # Socket-activated: exit when nobody is looking, so nothing of braidctl is
@@ -395,6 +395,7 @@ class Pool:
         self.cfg = cfg
         self.mnt = cfg["mountpoint"]
         self.label = cfg["label"]
+        self._last_smart = None
 
     # -- mount state
     def mount_entry(self):
@@ -763,15 +764,28 @@ class Pool:
         p = run(argv + [self.mnt], check=False)
         return p.stdout
 
-    def smart(self, dev):
+    # Exit status smartctl gives when -n standby skips a drive. 3 would mean a command-line
+    # error together with a failed open, which a real read cannot produce.
+    SMART_STANDBY_EXIT = 3
+
+    def smart(self, dev, prev=None):
+        """SMART health of a member, without spinning it up: a drive in standby is not
+        read, and the last reading is returned instead, marked standby and keeping the
+        time it was taken. prev is that reading if the caller keeps one; otherwise it is
+        the one in the status file, if that was taken from this same drive."""
         if not dev.present:
             return {}
         disk = parent_disk(dev.path)
-        p = run(["smartctl", "-j", "-H", "-A"] + list(self.cfg["smart_args"]) + [disk], check=False)
+        p = run(["smartctl", "-j", "-H", "-A", "-n", f"standby,{self.SMART_STANDBY_EXIT}"]
+                + list(self.cfg["smart_args"]) + [disk], check=False)
         try:
             j = json.loads(p.stdout)
         except json.JSONDecodeError:
             return {}
+        if p.returncode == self.SMART_STANDBY_EXIT and "smart_status" not in j:
+            if prev is None:
+                prev = self.last_smart(dev)
+            return {**(prev or {}), "standby": True}
         attrs = {a["id"]: a.get("raw", {}).get("value") for a in
                  j.get("ata_smart_attributes", {}).get("table", [])}
         return {
@@ -781,14 +795,30 @@ class Pool:
             "pending": attrs.get(197),
             "offline_uncorr": attrs.get(198),
             "power_on_hours": j.get("power_on_time", {}).get("hours"),
+            "at": int(time.time()),
         }
+
+    def last_smart(self, dev):
+        """The reading the last monitor pass wrote down for this drive. Matched on serial
+        as well as devid, so a replacement that reused the devid does not inherit it."""
+        if self._last_smart is None:
+            self._last_smart = {}
+            try:
+                snap = json.loads(Path(self.cfg.get("status_file") or "").read_text())
+                for d in snap.get("devices") or []:
+                    if d.get("smart") and d.get("serial"):
+                        self._last_smart[d["devid"]] = (d["serial"], d["smart"])
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        serial, s = self._last_smart.get(dev.devid, (None, None))
+        return {k: v for k, v in s.items() if k != "standby"} if s and serial == dev.serial else None
 
     def enrich(self, devs, smart=True):
         stats = self.dev_stats()
         for d in devs:
             d.errors = stats.get(d.path) or stats.get(f"devid:{d.devid}") or {}
-            # smartctl takes seconds per drive behind a USB bridge and spins up a
-            # sleeping one. Callers that refresh often read it on their own clock.
+            # smartctl takes seconds per drive. Callers that refresh often read it on
+            # their own clock.
             d.smart = self.smart(d) if smart else {}
         return devs
 
@@ -929,6 +959,8 @@ def device_health(d):
     if d.missing or not d.present:
         return "missing", "MISSING"
     s = d.smart
+    if s.get("standby") and s.get("passed") is None:
+        return "unknown", "STANDBY (SMART not read yet)"
     if not s or s.get("passed") is None:
         return "unknown", "SMART n/a"
     if s.get("passed") is False:
@@ -940,6 +972,10 @@ def device_health(d):
         text = "WARN " + " ".join(f"{k}={s[k]}" for k in bad)
     if s.get("temp") is not None:
         text += f" {s['temp']}°C"
+    if s.get("standby"):
+        # Not read this time so as not to spin it up; the values are the last reading's
+        at = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["at"])) if s.get("at") else "earlier"
+        text += f" (standby; SMART as of {at})"
     return level, text
 
 
@@ -2012,7 +2048,8 @@ def cmd_monitor(cfg, args):
         prev_realloc = sbase.get(key, {}).get("reallocated")
         realloc = s.get("reallocated") if s else None
         grew = realloc is not None and prev_realloc is not None and realloc > prev_realloc
-        if s:
+        # A drive in standby was not read; its values are the last reading's, or none
+        if s and not s.get("standby"):
             sbase[key] = {"reallocated": realloc}
         smart_bad = s and (s.get("passed") is False or (s.get("pending") or 0) > 0
                            or (s.get("offline_uncorr") or 0) > 0 or grew)

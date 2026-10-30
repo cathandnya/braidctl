@@ -176,9 +176,9 @@ class PoolView:
     """Everything the page shows, from the same snapshot_dict() the status file uses.
 
     Two caches, for two very different costs: btrfs reads are ioctls and can be repeated
-    every few seconds; SMART is seconds per drive behind a USB bridge and wakes a
-    sleeping one, so it is refreshed on a thread and seeded from the status file the
-    monitor already wrote."""
+    every few seconds; SMART is seconds per drive behind a USB bridge, so it is
+    refreshed on a thread and seeded from the status file the monitor already wrote.
+    A drive in standby is not read; it keeps its last reading, marked standby."""
 
     def __init__(self, core, cfg, log):
         self.core, self.cfg, self.log = core, cfg, log
@@ -206,7 +206,7 @@ class PoolView:
                 return
             devs = pool.devices()
             for d in devs:
-                self.smart[d.devid] = pool.smart(d)
+                self.smart[d.devid] = pool.smart(d, prev=self.smart.get(d.devid))
         except Exception as e:                      # a wedged drive must not kill the thread
             self.log.warning("SMART refresh failed: %s", e)
 
